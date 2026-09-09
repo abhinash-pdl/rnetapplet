@@ -1,0 +1,12 @@
+[Unit]
+Description=rnetapplet — NetworkManager tray applet for wlroots compositors
+After=graphical-session.target NetworkManager.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/rnetapplet
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

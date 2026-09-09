@@ -1,0 +1,33 @@
+[package]
+name = "rnetapplet"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust NetworkManager tray applet for wlroots Wayland compositors"
+license = "MIT"
+repository = "https://github.com/abhinash-pdl/rnetapplet"
+homepage = "https://github.com/abhinash-pdl/rnetapplet"
+keywords = ["networkmanager", "wayland", "tray", "wifi"]
+categories = ["os::linux-apis"]
+
+[[bin]]
+name = "rnetapplet"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-channel = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5", features = ["tokio"] }
+rusty_network_manager = "0.7"
+ksni = "0.3"
+gtk4 = { version = "0.11", features = ["v4_18"] }
+gtk4-layer-shell = { version = "0.8", features = ["v1_3"] }
+glib = "0.22"
+gio = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rqrr = "0.10"
+nokhwa = { version = "0.10", default-features = false, features = ["input-v4l", "decoding"] }

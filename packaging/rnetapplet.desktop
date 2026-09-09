@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=rnetapplet
+Comment=NetworkManager tray applet for wlroots Wayland compositors
+Exec=rnetapplet
+Icon=network-wireless-symbolic
+Type=Application
+Categories=System;Network;
+NoDisplay=true
+X-GNOME-Autostart-enabled=false
