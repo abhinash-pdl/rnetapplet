@@ -131,6 +131,21 @@ impl NmClient {
             if !is_wifi {
                 continue;
             }
+            let connected_once = map
+                .get("connection")
+                .and_then(|c| c.get("timestamp"))
+                .map(|v| {
+                    use zbus::zvariant::Value;
+                    match &**v {
+                        Value::U64(t) => *t > 0,
+                        Value::I64(t) => *t > 0,
+                        _ => false,
+                    }
+                })
+                .unwrap_or(false);
+            if !connected_once {
+                continue;
+            }
             if let Some(ssid_val) = map
                 .get("802-11-wireless")
                 .and_then(|w| w.get("ssid"))

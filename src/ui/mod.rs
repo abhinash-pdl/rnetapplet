@@ -32,7 +32,7 @@ button.suggested-action { transition: background-color 120ms ease-in-out; }
 .rnet-row-hover:active { background-color: alpha(@theme_fg_color, 0.13); }
 .rnet-qr { padding-left: 10px; padding-right: 10px; }
 .rnet-toolbar entry { min-height: 30px; }
-.rnet-lock-badge { background-color: @theme_base_color; border-radius: 999px; padding: 0.4px; }
+.rnet-lock-badge { background-color: @theme_base_color; border-radius: 999px; padding: 0.5px; }
 .rnet-lock-overlay { margin-left: -10px; margin-top: 10px; }
 ";
 
@@ -153,7 +153,8 @@ fn lock_emblem() -> gtk4::Image {
     lock.add_css_class("rnet-lock-badge");
     lock.set_halign(gtk4::Align::End);
     lock.set_valign(gtk4::Align::End);
-    lock.set_margin_end(1);
+    lock.set_margin_bottom(2);
+    lock.set_margin_end(0);
     lock
 }
 
@@ -161,6 +162,43 @@ fn bars_with_lock(strength: u8) -> gtk4::Widget {
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&signal_bars(strength)));
     overlay.add_overlay(&lock_emblem());
+    overlay.set_size_request(24, 24);
+    overlay.upcast()
+}
+
+fn custom_lock() -> gtk4::Widget {
+    let area = gtk4::DrawingArea::new();
+    area.set_content_width(12);
+    area.set_content_height(12);
+    area.add_css_class("rnet-lock-badge");
+    area.set_halign(gtk4::Align::Start);
+    area.set_valign(gtk4::Align::Start);
+    area.set_margin_top(16);
+    area.set_margin_start(14);
+    area.set_draw_func(|w, cr, _width, _height| {
+        let fg = w.color();
+        cr.set_source_rgba(
+            fg.red() as f64,
+            fg.green() as f64,
+            fg.blue() as f64,
+            fg.alpha() as f64,
+        );
+        cr.new_sub_path();
+        cr.arc(6.0, 6.0, 2.8, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+        cr.set_line_width(1.5);
+        let _ = cr.stroke();
+        rounded_rect(cr, 2.6, 5.6, 6.8, 5.0, 1.0);
+        let _ = cr.fill();
+        cr.arc(6.0, 8.2, 1.0, 0.0, 2.0 * std::f64::consts::PI);
+        let _ = cr.fill();
+    });
+    area.upcast()
+}
+
+fn bars_with_lock_custom(strength: u8) -> gtk4::Widget {
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&signal_bars(strength)));
+    overlay.add_overlay(&custom_lock());
     overlay.set_size_request(24, 24);
     overlay.upcast()
 }
@@ -195,7 +233,7 @@ fn net_icon(strength: u8, secured: bool) -> gtk4::Widget {
         if !secured {
             return signal_bars(strength).upcast();
         }
-        return bars_with_lock(strength);
+        return bars_with_lock_custom(strength);
     }
     let step = signal_step(strength);
     let sym = format!("network-wireless-signal-{step}-symbolic");
@@ -235,6 +273,81 @@ pub(crate) fn load_css() {
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_USER,
     );
+}
+
+fn portal_color_scheme() -> Option<u32> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let conn = zbus::Connection::session().await.ok()?;
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.portal.Desktop"),
+                "/org/freedesktop/portal/desktop",
+                Some("org.freedesktop.portal.Settings"),
+                "Read",
+                &("org.freedesktop.appearance", "color-scheme"),
+            )
+            .await
+            .ok()?;
+        let body: zbus::zvariant::OwnedValue = reply.body().deserialize().ok()?;
+        let val: zbus::zvariant::Value = body.into();
+        let scheme: Result<u32, _> = val.try_into();
+        scheme.ok().filter(|v| *v == 1 || *v == 2)
+    })
+}
+
+fn sync_color_scheme() {
+    let Some(scheme) = portal_color_scheme() else {
+        return;
+    };
+    let Some(settings) = gtk4::Settings::default() else {
+        return;
+    };
+    settings.set_property("gtk-application-prefer-dark-theme", scheme == 1);
+}
+
+fn debug_dump() {
+    let v = |n: &str| std::env::var(n).unwrap_or_else(|_| "(unset)".into());
+    eprintln!(
+        "[rnet-debug] WAYLAND_DISPLAY={} DISPLAY={} GDK_BACKEND={} GDK_SCALE={} GDK_DPI_SCALE={} XDG_CURRENT_DESKTOP={} XDG_SESSION_TYPE={} GTK_THEME={}",
+        v("WAYLAND_DISPLAY"),
+        v("DISPLAY"),
+        v("GDK_BACKEND"),
+        v("GDK_SCALE"),
+        v("GDK_DPI_SCALE"),
+        v("XDG_CURRENT_DESKTOP"),
+        v("XDG_SESSION_TYPE"),
+        v("GTK_THEME"),
+    );
+    if let Some(s) = gtk4::Settings::default() {
+        let prefer_dark: bool = s.property("gtk-application-prefer-dark-theme");
+        eprintln!(
+            "[rnet-debug] gtk-theme={:?} icon-theme={:?} prefer-dark={prefer_dark} xft-dpi={}",
+            s.gtk_theme_name(),
+            s.gtk_icon_theme_name(),
+            s.gtk_xft_dpi(),
+        );
+    }
+    if let Some(d) = gtk4::gdk::Display::default() {
+        for i in 0..d.monitors().n_items() {
+            if let Some(obj) = d.monitors().item(i)
+                && let Ok(m) = obj.downcast::<gtk4::gdk::Monitor>()
+            {
+                let g = m.geometry();
+                eprintln!(
+                    "[rnet-debug] monitor {i}: x={} y={} w={} h={} scale={}",
+                    g.x(),
+                    g.y(),
+                    g.width(),
+                    g.height(),
+                    m.scale_factor()
+                );
+            }
+        }
+    }
 }
 
 fn hide_popup(
@@ -279,6 +392,9 @@ struct UiHandles {
     focus_ssid: Rc<RefCell<Option<String>>>,
 
     pw_drafts: Rc<RefCell<HashMap<String, String>>>,
+
+    model_dirty: Rc<Cell<bool>>,
+    refresh_pending: Rc<Cell<bool>>,
 
     pending_secret_paths: Rc<RefCell<HashMap<String, String>>>,
 
@@ -548,13 +664,8 @@ fn ap_row(
     name_box.set_hexpand(true);
     let ssid = gtk4::Label::new(Some(&ap.ssid));
     ssid.set_halign(gtk4::Align::Start);
-    if expanded {
-        ssid.set_ellipsize(gtk4::pango::EllipsizeMode::None);
-        ssid.set_max_width_chars(200);
-    } else {
-        ssid.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        ssid.set_max_width_chars(21);
-    }
+    ssid.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    ssid.set_max_width_chars(if expanded { 40 } else { 21 });
     h.ssid_labels.borrow_mut().insert(ap.ssid.clone(), ssid.clone());
     name_box.append(&ssid);
     if is_active {
@@ -703,7 +814,7 @@ fn ap_row(
             submit.set_halign(gtk4::Align::End);
             submit.add_css_class("suggested-action");
 
-            submit.set_sensitive(entry.text().len() >= 8);
+            submit.set_sensitive((8..=63).contains(&entry.text().len()));
             details.append(&submit);
 
             {
@@ -722,7 +833,7 @@ fn ap_row(
                 let ssid = ap.ssid.clone();
                 let h = h.clone();
                 entry.connect_changed(move |e| {
-                    submit.set_sensitive(e.text().len() >= 8);
+                    submit.set_sensitive((8..=63).contains(&e.text().len()));
                     h.pw_drafts
                         .borrow_mut()
                         .insert(ssid.clone(), e.text().to_string());
@@ -743,10 +854,10 @@ fn ap_row(
                 let h = h.clone();
                 move || {
                     let psk = entry.text().to_string();
-                    if psk.len() < 8 {
+                    if !(8..=63).contains(&psk.len()) {
                         h.errors.borrow_mut().insert(
                             ssid.clone(),
-                            "Min 8 characters".into(),
+                            "Password must be 8-63 characters".into(),
                         );
                         refresh_list(&h);
                         return;
@@ -974,7 +1085,7 @@ fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
         let start = gtk4::Button::with_label("Start");
         start.add_css_class("suggested-action");
 
-        let valid_now = !ssid_entry.text().trim().is_empty() && pass_entry.text().len() >= 8;
+        let valid_now = !ssid_entry.text().trim().is_empty() && (8..=63).contains(&pass_entry.text().len());
         start.set_sensitive(valid_now);
         btn_row.append(&cancel);
         btn_row.append(&start);
@@ -996,7 +1107,7 @@ fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                 *draft_ssid.borrow_mut() = e.text().to_string();
                 *draft_psk.borrow_mut() = pass_g.text().to_string();
                 start_g.set_sensitive(
-                    !e.text().trim().is_empty() && pass_g.text().len() >= 8,
+                    !e.text().trim().is_empty() && (8..=63).contains(&pass_g.text().len()),
                 );
             });
         }
@@ -1008,7 +1119,7 @@ fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
             pass_entry.connect_changed(move |e| {
                 *draft_psk.borrow_mut() = e.text().to_string();
                 start.set_sensitive(
-                    !ssid_entry.text().trim().is_empty() && e.text().len() >= 8,
+                    !ssid_entry.text().trim().is_empty() && (8..=63).contains(&e.text().len()),
                 );
             });
         }
@@ -1025,9 +1136,9 @@ fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                     refresh_list(&h);
                     return;
                 }
-                if psk.len() < 8 {
+                if !(8..=63).contains(&psk.len()) {
                     *h.hotspot_error.borrow_mut() =
-                        Some("Min 8 characters".into());
+                        Some("Password must be 8-63 characters".into());
                     refresh_list(&h);
                     return;
                 }
@@ -1047,6 +1158,7 @@ fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
 }
 
 fn refresh_list(h: &UiHandles) {
+    let focus_target = h.focus_ssid.borrow().clone();
 
     let adj = h.scroll.vadjustment();
     let saved_pos = adj.value();
@@ -1156,6 +1268,31 @@ fn refresh_list(h: &UiHandles) {
         let max = (adj2.upper() - adj2.page_size()).max(adj2.lower());
         adj2.set_value(saved_pos.clamp(adj2.lower(), max));
     });
+
+    if let Some(ssid) = focus_target {
+        *h.focus_ssid.borrow_mut() = Some(ssid.clone());
+        let h2 = h.clone();
+        let mut tries: u32 = 0;
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            tries += 1;
+            let has_entry = h2
+                .pw_entries
+                .borrow()
+                .get(&ssid)
+                .map(|e| e.is_mapped())
+                .unwrap_or(false);
+            if has_entry {
+                if let Some(e) = h2.pw_entries.borrow().get(&ssid) {
+                    e.grab_focus();
+                }
+            }
+            if has_entry || tries >= 250 {
+                gtk4::glib::ControlFlow::Break
+            } else {
+                gtk4::glib::ControlFlow::Continue
+            }
+        });
+    }
 }
 
 fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
@@ -1297,6 +1434,11 @@ pub fn run(
         }
     });
 
+    if std::env::var("RNET_DEBUG").is_ok() {
+        debug_dump();
+    }
+    sync_color_scheme();
+
     let app = gtk4::Application::new(Some("dev.abhinash-pdl.rnetapplet"), Default::default());
 
     app.connect_activate(move |app| {
@@ -1378,7 +1520,7 @@ pub fn run(
         vbox.set_margin_bottom(0);
         vbox.set_margin_start(0);
         vbox.set_margin_end(0);
-        vbox.set_size_request(200, 560);
+        vbox.set_size_request(POPUP_W, 560);
 
         let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         header.add_css_class("rnet-header");
@@ -1507,7 +1649,7 @@ pub fn run(
         popup_revealer.set_child(Some(&vbox));
         popup_revealer.set_halign(gtk4::Align::End);
         popup_revealer.set_valign(gtk4::Align::Start);
-        popup_revealer.set_size_request(200, -1);
+        popup_revealer.set_size_request(POPUP_W, -1);
         overlay.add_overlay(&popup_revealer);
 
         {
@@ -1538,6 +1680,8 @@ pub fn run(
             errors: errors.clone(),
             err_token: err_token.clone(),
             pw_drafts: pw_drafts.clone(),
+            model_dirty: Rc::new(Cell::new(false)),
+            refresh_pending: Rc::new(Cell::new(false)),
             focus_ssid: focus_ssid.clone(),
             pending_secret_paths: pending_secret_paths.clone(),
             connecting: connecting.clone(),
@@ -1595,7 +1739,7 @@ pub fn run(
                     } else {
                         h.hotspot_ssid.borrow().clone()
                     };
-                    if !ssid.trim().is_empty() && psk.len() >= 8 {
+                    if !ssid.trim().is_empty() && (8..=63).contains(&psk.len()) {
                         h.hotspot_error.borrow_mut().take();
                         let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot { ssid, psk });
                         return;
@@ -1769,7 +1913,20 @@ let wifi_on = m.wifi_enabled && !m.airplane_mode();
                                 }
                             }
                             *h.model.borrow_mut() = m;
-                            refresh_list(&h);
+                            h.model_dirty.set(true);
+                            if !h.refresh_pending.replace(true) {
+                                let h2 = h.clone();
+                                gtk4::glib::timeout_add_local(
+                                    std::time::Duration::from_millis(120),
+                                    move || {
+                                        h2.refresh_pending.set(false);
+                                        if h2.model_dirty.replace(false) {
+                                            refresh_list(&h2);
+                                        }
+                                        gtk4::glib::ControlFlow::Break
+                                    },
+                                );
+                            }
                         }
                         UiEvent::SecretsNeeded { ssid, path, request_new } => {
                             h.connecting.borrow_mut().remove(&ssid);

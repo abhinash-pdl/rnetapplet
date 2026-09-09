@@ -64,6 +64,19 @@ pub(crate) fn root_path() -> Result<OwnedObjectPath> {
     OwnedObjectPath::try_from("/").context("static root object path")
 }
 
+pub fn validate_psk(psk: &str) -> Result<()> {
+    if !(8..=63).contains(&psk.len()) {
+        anyhow::bail!("password must be 8-63 characters");
+    }
+    if psk.chars().any(|c| c.is_control())
+        || psk.trim_start() != psk
+        || psk.trim_end() != psk
+    {
+        anyhow::bail!("password cannot contain control characters or leading/trailing spaces");
+    }
+    Ok(())
+}
+
 impl NmClient {
 
     async fn ap_path_for_ssid(
@@ -114,6 +127,7 @@ impl NmClient {
     }
 
     pub async fn connect_secure(&self, ssid: &str, psk: &str) -> Result<()> {
+        validate_psk(psk)?;
         let wifi = self
             .wifi_device_path()
             .await?
@@ -129,6 +143,9 @@ impl NmClient {
     }
 
     pub async fn connect_hidden(&self, ssid: &str, psk: &str) -> Result<()> {
+        if !psk.is_empty() {
+            validate_psk(psk)?;
+        }
         let wifi = self
             .wifi_device_path()
             .await?
@@ -241,6 +258,159 @@ impl NmClient {
         }
         anyhow::bail!("no active Wi-Fi connection to disconnect");
     }
+
+    pub async fn active_wifi_snapshot(
+        &self,
+    ) -> Option<(zbus::zvariant::OwnedObjectPath, String)> {
+        use rusty_network_manager::{ActiveProxy, SettingsConnectionProxy};
+        for path in self.nm.active_connections().await.unwrap_or_default() {
+            let Ok(proxy) = ActiveProxy::new_from_path(path, self.system_conn()).await else {
+                continue;
+            };
+            if proxy.type_().await != Ok("802-11-wireless".to_string()) {
+                continue;
+            }
+            if proxy.state().await != Ok(2) {
+                continue;
+            }
+            let Ok(profile) = proxy.connection().await else {
+                continue;
+            };
+            let Ok(sc) =
+                SettingsConnectionProxy::new_from_path(profile.clone(), self.system_conn()).await
+            else {
+                continue;
+            };
+            let Ok(map) = sc.get_settings().await else {
+                continue;
+            };
+            let is_ap = map
+                .get("802-11-wireless")
+                .and_then(|w| w.get("mode"))
+                .map(|v| matches!(&**v, Value::Str(s) if s.as_str() == "ap"))
+                .unwrap_or(false);
+            if is_ap {
+                continue;
+            }
+            let ssid = map
+                .get("802-11-wireless")
+                .and_then(|w| w.get("ssid"))
+                .and_then(|v| match &**v {
+                    Value::Array(arr) => {
+                        let bytes: Vec<u8> =
+                            arr.iter().filter_map(|b| u8::try_from(b).ok()).collect();
+                        crate::nm_client::aps::decode_ssid(&bytes)
+                    }
+                    _ => None,
+                });
+            if let Some(ssid) = ssid {
+                return Some((profile, ssid));
+            }
+        }
+        None
+    }
+
+    pub async fn reactivate_previous(
+        &self,
+        ssid: &str,
+        profile: &zbus::zvariant::OwnedObjectPath,
+    ) -> Result<()> {
+        let wifi = self
+            .wifi_device_path()
+            .await?
+            .context("no Wi-Fi device found")?;
+        let ap = self.ap_path_for_ssid(&wifi, ssid).await?;
+        self.nm.activate_connection(profile, &wifi, &ap).await?;
+        tracing::info!(ssid, %profile, "previous connection reactivated after failed activation");
+        Ok(())
+    }
+
+    pub async fn restore_previous(&self, prev: Option<PrevWifi>) -> Result<bool> {
+        if let Some(PrevWifi { profile, ssid }) = prev {
+            self.reactivate_previous(&ssid, &profile).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+pub struct PrevWifi {
+    pub profile: zbus::zvariant::OwnedObjectPath,
+    pub ssid: String,
+}
+
+pub fn spawn_restore_guard(
+    client: std::sync::Arc<NmClient>,
+    mut watch_rx: crate::state::ModelRx,
+    model_feed: async_channel::Sender<crate::state::UiEvent>,
+    target_ssid: String,
+    prev: Option<PrevWifi>,
+    window: Duration,
+) {
+    tokio::spawn(async move {
+        let Some(prev) = prev else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + window;
+        let mut none_since: Option<tokio::time::Instant> = None;
+        let mut saw_disconnect = false;
+        loop {
+            let m = watch_rx.borrow().clone();
+            match m.active_ssid.as_deref() {
+                Some(s) if s == target_ssid.as_str() => return,
+                Some(s) if s == prev.ssid.as_str() && saw_disconnect => return,
+                Some(_) if saw_disconnect => return,
+                None => {
+                    saw_disconnect = true;
+                    if none_since.is_none() {
+                        none_since = Some(tokio::time::Instant::now());
+                    }
+                    if none_since
+                        .as_ref()
+                        .map(|t| t.elapsed() >= Duration::from_secs(8))
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if !m.wifi_enabled {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if tokio::time::timeout(Duration::from_millis(300), watch_rx.changed())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        match client.reactivate_previous(&prev.ssid, &prev.profile).await {
+            Ok(()) => {
+                let _ = model_feed
+                    .try_send(crate::state::UiEvent::SsidError {
+                        ssid: target_ssid.clone(),
+                        message: format!(
+                            "Could not connect to “{target_ssid}”. Reconnected to “{}”.",
+                            prev.ssid
+                        ),
+                    });
+            }
+            Err(e) => {
+                tracing::warn!("failed to restore previous network {}: {e:#}", prev.ssid);
+                let _ = model_feed.try_send(crate::state::UiEvent::SsidError {
+                    ssid: target_ssid.clone(),
+                    message: format!(
+                        "Could not connect to “{target_ssid}”. Reconnect to “{}” manually.",
+                        prev.ssid
+                    ),
+                });
+            }
+        }
+    });
 }
 
 pub fn refresh_staggered(client: Arc<NmClient>, tx: ModelTx) -> tokio::task::JoinHandle<()> {
@@ -294,5 +464,17 @@ mod tests {
         let sec = hidden_profile("Hid", "pw123456");
         assert!(matches!(&sec["802-11-wireless"]["hidden"], Value::Bool(true)));
         assert!(matches!(&sec["802-11-wireless-security"]["psk"], Value::Str(s) if s.as_str() == "pw123456"));
+    }
+
+    #[test]
+    fn psk_validation_rules() {
+        assert!(validate_psk("12345678").is_ok());
+        assert!(validate_psk("p".repeat(63).as_str()).is_ok());
+        assert!(validate_psk("short").is_err());
+        assert!(validate_psk(&"p".repeat(64)).is_err());
+        assert!(validate_psk(" 1234567").is_err());
+        assert!(validate_psk("1234567 ").is_err());
+        assert!(validate_psk("1234\n567").is_err());
+        assert!(validate_psk("").is_err());
     }
 }

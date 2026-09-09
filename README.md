@@ -15,6 +15,9 @@ connections; everything happens inside the popup.
 - One-click connect to saved or open networks
 - Inline password entry — the applet acts as its own NetworkManager
   SecretAgent, so a wrong password can be retried without a dialog
+- Malformed passwords are rejected before they reach NetworkManager, and
+  if a connect attempt fails, the previous network is re-activated
+  automatically
 - Wi-Fi and airplane-mode toggles
 - Hotspot creation (with name and password)
 - QR-code connect from a webcam or an image file
@@ -141,6 +144,45 @@ Sway (`~/.config/sway/config`):
 exec /usr/bin/rnetapplet
 ```
 
+## Running under systemd
+
+The shipped unit (`rnetapplet.service`) runs per-user, stops with the
+graphical session (`PartOf=graphical-session.target`), and restarts on
+failure (`Restart=on-failure`). Manage it with systemd:
+
+```sh
+systemctl --user enable --now rnetapplet   # start now and at login
+systemctl --user restart rnetapplet        # after updating or reinstalling
+systemctl --user status rnetapplet
+journalctl --user -u rnetapplet -f          # follow its logs
+```
+
+The user manager starts with a minimal environment: variables your desktop
+session exports — `GTK_THEME`, `GDK_BACKEND`, GPU/Mesa overrides, and so on —
+are not carried over, which can make the popup render in a default theme, at
+a different scale, or through a software-GL path. Give the service the same
+environment as your session, per-service, with a drop-in:
+
+```sh
+mkdir -p ~/.config/systemd/user/rnetapplet.service.d
+cat > ~/.config/systemd/user/rnetapplet.service.d/10-desktop-env.conf <<'EOF'
+[Service]
+Environment=GTK_THEME=Materia-dark
+Environment=GDK_BACKEND=wayland,x11
+Environment=MESA_LOADER_DRIVER_OVERRIDE=iris
+EOF
+systemctl --user daemon-reload
+systemctl --user restart rnetapplet
+```
+
+Set each `Environment=` line to match your own session. The applet itself
+defaults `GDK_BACKEND=wayland,x11` when the variable is unset, so the main
+things to mirror are the theme and any GPU/driver overrides. As an
+alternative to a drop-in, import the session environment into the user
+manager before starting the service (niri:
+`spawn-at-startup "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP"`,
+Hyprland: the same command in `exec-once`).
+
 ## Usage
 
 - Left-click the tray icon to open or close the popup.
@@ -166,6 +208,7 @@ rnetapplet --connect-saved "SSID"
 | Popup does not open | The compositor must support `wlr-layer-shell`. |
 | Hotspot fails to start | The Wi-Fi driver does not support AP mode; check `journalctl -u NetworkManager`. |
 | Missing icons | Run `rnetapplet --dump-aps` and look at the icon-theme audit. |
+| Popup theme differs when autostarted by systemd | The user manager did not inherit the compositor's environment. See [Running under systemd](#running-under-systemd) for the per-service drop-in or `import-environment` fix. |
 
 ## Development
 

@@ -82,6 +82,10 @@ fn main() -> Result<()> {
         return rt.block_on(dump_aps());
     }
 
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        unsafe { std::env::set_var("GDK_BACKEND", "wayland,x11") };
+    }
+
     wait_for_compositor(std::time::Duration::from_secs(20))?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -539,23 +543,55 @@ async fn backend_main(
                     }
                     Ok(state::BackendCmd::ConnectOpen(ssid)) => {
                         info!(ssid, "connect requested (open)");
-                        if let Err(e) = client.connect_open(&ssid).await {
-                            tracing::warn!("connect_open {ssid} failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: ssid.clone(),
-                                message: format!("Could not connect: {e:#}"),
-                            });
+                        let prev = client.active_wifi_snapshot().await.map(|(p, s)| {
+                            nm_client::connect::PrevWifi { profile: p, ssid: s }
+                        });
+                        match client.connect_open(&ssid).await {
+                            Ok(()) => {
+                                nm_client::connect::spawn_restore_guard(
+                                    client.clone(),
+                                    watch_rx.clone(),
+                                    model_feed.clone(),
+                                    ssid.clone(),
+                                    prev,
+                                    std::time::Duration::from_secs(30),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("connect_open {ssid} failed: {e:#}");
+                                let _ = client.restore_previous(prev).await;
+                                let _ = model_feed.try_send(state::UiEvent::SsidError {
+                                    ssid: ssid.clone(),
+                                    message: format!("Could not connect: {e:#}"),
+                                });
+                            }
                         }
                         nm_client::connect::refresh_staggered(client.clone(), watch_tx.clone());
                     }
                     Ok(state::BackendCmd::ConnectSaved(ssid)) => {
                         info!(ssid, "connect requested (saved profile)");
-                        if let Err(e) = client.connect_saved(&ssid).await {
-                            tracing::warn!("connect_saved {ssid} failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: ssid.clone(),
-                                message: format!("Could not connect: {e:#}"),
-                            });
+                        let prev = client.active_wifi_snapshot().await.map(|(p, s)| {
+                            nm_client::connect::PrevWifi { profile: p, ssid: s }
+                        });
+                        match client.connect_saved(&ssid).await {
+                            Ok(()) => {
+                                nm_client::connect::spawn_restore_guard(
+                                    client.clone(),
+                                    watch_rx.clone(),
+                                    model_feed.clone(),
+                                    ssid.clone(),
+                                    prev,
+                                    std::time::Duration::from_secs(30),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("connect_saved {ssid} failed: {e:#}");
+                                let _ = client.restore_previous(prev).await;
+                                let _ = model_feed.try_send(state::UiEvent::SsidError {
+                                    ssid: ssid.clone(),
+                                    message: format!("Could not connect: {e:#}"),
+                                });
+                            }
                         }
                         nm_client::connect::refresh_staggered(client.clone(), watch_tx.clone());
                     }
@@ -568,19 +604,38 @@ async fn backend_main(
                     }
                     Ok(state::BackendCmd::ConnectSecure { ssid, psk }) => {
                         info!(ssid, "connect requested (inline password)");
-
-                        if let Err(e) = client.connect_secure(&ssid, &psk).await {
-                            tracing::warn!("connect_secure {ssid} failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: ssid.clone(),
-                                message: format!("Could not connect: {e:#}"),
-                            });
+                        let prev = client.active_wifi_snapshot().await.map(|(p, s)| {
+                            nm_client::connect::PrevWifi { profile: p, ssid: s }
+                        });
+                        match client.connect_secure(&ssid, &psk).await {
+                            Ok(()) => {
+                                nm_client::connect::spawn_restore_guard(
+                                    client.clone(),
+                                    watch_rx.clone(),
+                                    model_feed.clone(),
+                                    ssid.clone(),
+                                    prev,
+                                    std::time::Duration::from_secs(30),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("connect_secure {ssid} failed: {e:#}");
+                                let _ = client.restore_previous(prev).await;
+                                let _ = model_feed.try_send(state::UiEvent::SsidError {
+                                    ssid: ssid.clone(),
+                                    message: format!("Could not connect: {e:#}"),
+                                });
+                            }
                         }
                         nm_client::connect::refresh_staggered(client.clone(), watch_tx.clone());
                     }
                     Ok(state::BackendCmd::ProvideSecret { path, psk }) => {
                         info!(%path, "retry password provided");
-                        secrets.provide(&path, psk).await;
+                        if let Err(e) = nm_client::connect::validate_psk(&psk) {
+                            tracing::warn!("rejected invalid retry password for {path}: {e:#}");
+                        } else {
+                            secrets.provide(&path, psk).await;
+                        }
                     }
                     Ok(state::BackendCmd::SetAirplane(on)) => {
                         info!(on, "airplane mode requested");
