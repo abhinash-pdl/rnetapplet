@@ -1,6 +1,6 @@
 [package]
 name = "rnetapplet"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Native Rust NetworkManager tray applet for wlroots Wayland compositors"
 license = "MIT"

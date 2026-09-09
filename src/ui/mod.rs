@@ -1402,17 +1402,37 @@ pub fn run(
         toolbar.set_margin_start(4);
         toolbar.set_margin_end(4);
 
+        let wifi_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        let wifi_icon = gtk4::Image::from_icon_name(&themed_icon(&[
+            "network-wireless-symbolic",
+            "network-wireless-disabled-symbolic",
+        ]));
+        wifi_icon.set_pixel_size(18);
+        wifi_icon.set_valign(gtk4::Align::Center);
+        wifi_icon.set_tooltip_text(Some("Wi-Fi"));
+        wifi_row.append(&wifi_icon);
         let wifi_switch = gtk4::Switch::new();
         wifi_switch.set_valign(gtk4::Align::Center);
         wifi_switch.set_active(model.borrow().wifi_enabled);
         wifi_switch.set_tooltip_text(Some("Wi-Fi"));
-        toolbar.append(&wifi_switch);
+        wifi_row.append(&wifi_switch);
+        toolbar.append(&wifi_row);
 
+        let air_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        let air_icon = gtk4::Image::from_icon_name(&themed_icon(&[
+            "airplane-mode-symbolic",
+            "network-wireless-disabled-symbolic",
+        ]));
+        air_icon.set_pixel_size(18);
+        air_icon.set_valign(gtk4::Align::Center);
+        air_icon.set_tooltip_text(Some("Airplane mode"));
+        air_row.append(&air_icon);
         let air_switch = gtk4::Switch::new();
         air_switch.set_valign(gtk4::Align::Center);
         air_switch.set_active(model.borrow().airplane_mode());
         air_switch.set_tooltip_text(Some("Airplane mode"));
-        toolbar.append(&air_switch);
+        air_row.append(&air_switch);
+        toolbar.append(&air_row);
 
         {
             let tx = cmd_tx.clone();
@@ -1594,11 +1614,33 @@ pub fn run(
             let tx = cmd_tx.clone();
             if let Some(settings) = gtk4::Settings::default() {
                 let tx2 = tx.clone();
+                let tx3 = tx.clone();
+                let h2 = h.clone();
+                let window2 = window.clone();
+                let revealer2 = popup_revealer.clone();
+                let refresh = Rc::new(move || {
+                    THEMED_CACHE.with(|c| c.borrow_mut().clear());
+                    LOOKUP_CACHE.with(|c| c.borrow_mut().clear());
+                    refresh_list(&h2);
+                    window2.queue_resize();
+                    window2.queue_draw();
+                    revealer2.queue_resize();
+                    revealer2.queue_draw();
+                });
+                let r1 = refresh.clone();
                 settings.connect_gtk_icon_theme_name_notify(move |_| {
+                    r1();
                     let _ = tx.try_send(BackendCmd::RefreshTray);
                 });
+                let r2 = refresh.clone();
                 settings.connect_gtk_theme_name_notify(move |_| {
+                    r2();
                     let _ = tx2.try_send(BackendCmd::RefreshTray);
+                });
+                let r3 = refresh.clone();
+                settings.connect_gtk_xft_dpi_notify(move |_| {
+                    r3();
+                    let _ = tx3.try_send(BackendCmd::RefreshTray);
                 });
             }
         }
@@ -1643,6 +1685,8 @@ pub fn run(
             let h = h.clone();
             let wifi_switch = wifi_switch.clone();
             let air_switch = air_switch.clone();
+            let wifi_icon = wifi_icon.clone();
+            let air_icon = air_icon.clone();
             let prog_guard = prog_guard.clone();
             let hotspot_btn = hotspot_btn.clone();
             let ctx = gtk4::glib::MainContext::default();
@@ -1666,6 +1710,20 @@ pub fn run(
                                 wifi_switch.set_active(false);
                                 prog_guard.set(false);
                             }
+let wifi_on = m.wifi_enabled && !m.airplane_mode();
+                            if wifi_on {
+                                wifi_icon.set_icon_name(Some(&themed_icon(&[
+                                    "network-wireless-symbolic",
+                                    "network-wireless-disabled-symbolic",
+                                ])));
+                            } else {
+                                wifi_icon.set_icon_name(Some(&themed_icon(&[
+                                    "network-wireless-disabled-symbolic",
+                                    "network-wireless-symbolic",
+                                ])));
+                            }
+                            wifi_icon.set_opacity(if wifi_on { 1.0 } else { 0.5 });
+                            air_icon.set_opacity(if m.airplane_mode() { 1.0 } else { 0.5 });
                             let hs_active = m.hotspot.as_ref().map(|x| x.active).unwrap_or(false);
                             if hs_active {
                                 hotspot_btn.add_css_class("suggested-action");

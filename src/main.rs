@@ -306,12 +306,22 @@ fn wait_for_compositor(timeout: std::time::Duration) -> Result<()> {
     gtk4::init()?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if gtk4::gdk::Display::default().is_some() {
-            return Ok(());
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let theme_ready = gtk4::Settings::default()
+                .and_then(|s| s.gtk_icon_theme_name())
+                .is_some()
+                && (gtk4::IconTheme::for_display(&display)
+                    .has_icon("network-wireless-signal-ok-symbolic")
+                    || gtk4::IconTheme::for_display(&display)
+                        .has_icon("network-wireless-symbolic"));
+            if theme_ready {
+                return Ok(());
+            }
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out after {}s waiting for the compositor to become ready",
+                "timed out after {}s waiting for the desktop theme and icon theme to become \
+                 available (the compositor may still be starting up)",
                 timeout.as_secs()
             );
         }

@@ -82,9 +82,9 @@ install it:
 
 ```sh
 curl -L -o rnetapplet.tar.gz \
-  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.0/rnetapplet-0.1.0-x86_64-linux.tar.gz
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.1/rnetapplet-0.1.1-x86_64-linux.tar.gz
 tar xzf rnetapplet.tar.gz
-cd rnetapplet-0.1.0-x86_64-linux
+cd rnetapplet-0.1.1-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
