@@ -14,7 +14,7 @@ name = "rnetapplet"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "signal"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-channel = "2"
@@ -31,3 +31,9 @@ gio = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rqrr = "0.10"
 nokhwa = { version = "0.10", default-features = false, features = ["input-v4l", "decoding"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
