@@ -505,15 +505,20 @@ async fn backend_main(
             }
         }
     });
-    let tray_handle = match tray::spawn(model.clone(), tray_ev_tx.clone()).await {
-        Ok(h) => {
-            info!("tray registered as org.kde.StatusNotifierItem (id=rnetapplet)");
-            h
-        }
-        Err(e) => {
-            tracing::error!("SNI tray host not available, running without a tray icon: {e:#}");
-            let _ = quit_tx.try_send(());
-            return;
+    let tray_handle = {
+        let mut wait = std::time::Duration::from_secs(3);
+        loop {
+            match tray::spawn(model.clone(), tray_ev_tx.clone()).await {
+                Ok(h) => {
+                    info!("tray registered as org.kde.StatusNotifierItem (id=rnetapplet)");
+                    break h;
+                }
+                Err(e) => {
+                    tracing::warn!("SNI tray host not available ({e:#}); retrying in {wait:?}");
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
         }
     };
     let _tray_updater = tray::spawn_updater(tray_handle.clone(), watch_rx.clone());

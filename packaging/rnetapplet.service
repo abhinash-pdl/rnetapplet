@@ -1,6 +1,8 @@
 [Unit]
 Description=rnetapplet — NetworkManager tray applet for wlroots compositors
-After=graphical-session.target NetworkManager.service
+After=graphical-session.target NetworkManager.service xdg-desktop-portal.service
+Wants=graphical-session.target
+Wants=xdg-desktop-portal.service
 PartOf=graphical-session.target
 
 [Service]
