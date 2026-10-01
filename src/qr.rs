@@ -116,10 +116,10 @@ pub fn parse_wifi_qr(text: &str) -> Option<WifiQr> {
 fn decode_gray(gray: GrayImage) -> Option<String> {
     let mut prepared = rqrr::PreparedImage::prepare(gray);
     for grid in prepared.detect_grids() {
-        if let Ok((_, content)) = grid.decode() {
-            if content.starts_with("WIFI:") {
-                return Some(content);
-            }
+        if let Ok((_, content)) = grid.decode()
+            && content.starts_with("WIFI:")
+        {
+            return Some(content);
         }
     }
     None
@@ -136,10 +136,10 @@ pub fn decode_wifi_qr(bytes: &[u8]) -> Result<WifiQr> {
     let mut inverted = thresholded.clone();
     image::imageops::invert(&mut inverted);
     for candidate in [original, thresholded, inverted] {
-        if let Some(content) = decode_gray(candidate) {
-            if let Some(qr) = parse_wifi_qr(&content) {
-                return Ok(qr);
-            }
+        if let Some(content) = decode_gray(candidate)
+            && let Some(qr) = parse_wifi_qr(&content)
+        {
+            return Ok(qr);
         }
     }
     anyhow::bail!("no Wi-Fi QR payload found");

@@ -1,6 +1,6 @@
 [package]
 name = "rnetapplet"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Native Rust NetworkManager tray applet for wlroots Wayland compositors"
 license = "MIT"
@@ -15,8 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "signal"] }
-tokio-stream = "0.1"
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 async-channel = "2"
 anyhow = "1"
 tracing = "0.1"

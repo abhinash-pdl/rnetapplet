@@ -86,59 +86,19 @@ fn hotspot_profile<'a>(
 }
 
 impl NmClient {
-
-    pub async fn hotspot_profile_path(
-        &self,
-    ) -> Result<Option<zbus::zvariant::OwnedObjectPath>> {
-        use rusty_network_manager::{SettingsConnectionProxy, SettingsProxy};
-        let settings = SettingsProxy::new(self.system_conn()).await?;
-        for path in settings.list_connections().await.unwrap_or_default() {
-            let Ok(proxy) =
-                SettingsConnectionProxy::new_from_path(path.clone(), self.system_conn()).await
-            else {
-                continue;
-            };
-            let Ok(map) = proxy.get_settings().await else {
-                continue;
-            };
-            let is_ap = map
-                .get("802-11-wireless")
-                .and_then(|w| w.get("mode"))
-                .map(|v| matches!(&**v, Value::Str(s) if s.as_str() == "ap"))
-                .unwrap_or(false);
-            if is_ap {
-                return Ok(Some(path));
-            }
-        }
-        Ok(None)
+    pub async fn hotspot_profile_path(&self) -> Result<Option<zbus::zvariant::OwnedObjectPath>> {
+        super::profiles::hotspot_profile_path(self.system_conn()).await
     }
 
     pub async fn saved_hotspot_config(&self) -> Result<Option<(String, Option<String>)>> {
-        use rusty_network_manager::SettingsConnectionProxy;
         let Some(path) = self.hotspot_profile_path().await? else {
             return Ok(None);
         };
-        let proxy =
-            SettingsConnectionProxy::new_from_path(path, self.system_conn()).await?;
-        let map = proxy.get_settings().await?;
-        let ssid = map
-            .get("802-11-wireless")
-            .and_then(|w| w.get("ssid"))
-            .and_then(|v| match &**v {
-                Value::Array(arr) => {
-                    let bytes: Vec<u8> =
-                        arr.iter().filter_map(|b| u8::try_from(b).ok()).collect();
-                    crate::nm_client::aps::decode_ssid(&bytes)
-                }
-                _ => None,
-            });
-        let psk = map
-            .get("802-11-wireless-security")
-            .and_then(|w| w.get("psk"))
-            .and_then(|v| match &**v {
-                Value::Str(s) => Some(s.to_string()),
-                _ => None,
-            });
+        let map = super::get_settings(self.system_conn(), &path)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("could not read hotspot profile"))?;
+        let ssid = super::profiles::wireless_ssid(&map);
+        let psk = super::profiles::profile_psk(&map);
         Ok(ssid.map(|s| (s, psk)))
     }
 
@@ -150,37 +110,16 @@ impl NmClient {
             .await?
             .context("no Wi-Fi device found")?;
         let root = super::connect::root_path()?;
-        if let Ok(Some((saved_ssid, saved_psk))) = self.saved_hotspot_config().await {
-            if saved_ssid == ssid && saved_psk.as_deref() == Some(psk) {
-                if let Ok(Some(path)) = self.hotspot_profile_path().await {
-                    let active = self.nm.activate_connection(&path, &wifi, &root).await?;
-                    tracing::info!(%active, ssid, "saved hotspot activated");
-                    return Ok((ssid, psk.to_string()));
-                }
-            }
+        if let Ok(Some((saved_ssid, saved_psk))) = self.saved_hotspot_config().await
+            && saved_ssid == ssid
+            && saved_psk.as_deref() == Some(psk)
+            && let Ok(Some(path)) = self.hotspot_profile_path().await
+        {
+            let active = self.nm.activate_connection(&path, &wifi, &root).await?;
+            tracing::info!(%active, ssid, "saved hotspot activated");
+            return Ok((ssid, psk.to_string()));
         }
-        use rusty_network_manager::{SettingsConnectionProxy, SettingsProxy};
-        if let Ok(settings) = SettingsProxy::new(self.system_conn()).await {
-            for path in settings.list_connections().await.unwrap_or_default() {
-                let Ok(proxy) =
-                    SettingsConnectionProxy::new_from_path(path.clone(), self.system_conn())
-                        .await
-                else {
-                    continue;
-                };
-                let Ok(map) = proxy.get_settings().await else {
-                    continue;
-                };
-                let is_ap = map
-                    .get("802-11-wireless")
-                    .and_then(|w| w.get("mode"))
-                    .map(|v| matches!(&**v, Value::Str(s) if s.as_str() == "ap"))
-                    .unwrap_or(false);
-                if is_ap {
-                    let _ = proxy.delete().await;
-                }
-            }
-        }
+        super::profiles::delete_all_hotspot_profiles(self.system_conn()).await;
         let profile = hotspot_profile(&ssid, psk);
         let (conn, active) = self
             .nm
@@ -191,7 +130,6 @@ impl NmClient {
     }
 
     pub async fn create_hotspot(&self) -> Result<(String, String)> {
-
         if let Ok(Some((ssid, Some(psk)))) = self.saved_hotspot_config().await {
             return self.create_hotspot_with(&ssid, &psk).await;
         }
@@ -200,33 +138,20 @@ impl NmClient {
     }
 
     pub async fn stop_hotspot(&self) -> Result<()> {
-        use rusty_network_manager::{ActiveProxy, SettingsConnectionProxy};
+        use rusty_network_manager::ActiveProxy;
         for path in self.nm.active_connections().await.unwrap_or_default() {
             let Ok(active) = ActiveProxy::new_from_path(path.clone(), self.system_conn()).await
             else {
                 continue;
             };
-
-            let mut is_hs = false;
-            if let Ok(conn_path) = active.connection().await {
-                if let Ok(sc) =
-                    SettingsConnectionProxy::new_from_path(conn_path, self.system_conn()).await
-                {
-                    if let Ok(map) = sc.get_settings().await {
-                        is_hs = map
-                            .get("802-11-wireless")
-                            .and_then(|w| w.get("mode"))
-                            .map(|v| {
-                                matches!(&**v, Value::Str(s) if s.as_str() == "ap")
-                            })
-                            .unwrap_or(false);
-                    }
-                }
+            if active.type_().await.as_deref() != Ok("802-11-wireless") {
+                continue;
             }
-
-            let id_match = active.id().await.as_deref() == Ok(HOTSPOT_CONN_ID)
-                || active.id().await.as_deref() == Ok(HOTSPOT_SSID);
-            if is_hs || id_match {
+            let id = active.id().await.unwrap_or_default();
+            let is_hs = super::active_conn_is_hotspot(self.system_conn(), &path).await
+                || id == HOTSPOT_CONN_ID
+                || id == HOTSPOT_SSID;
+            if is_hs {
                 self.nm.deactivate_connection(&path).await?;
                 tracing::info!("hotspot deactivated");
                 return Ok(());
@@ -244,7 +169,10 @@ mod tests {
     fn psk_charset_and_len() {
         let p = random_psk();
         assert_eq!(p.len(), 12);
-        assert!(p.bytes().all(|b| b"abcdefghjkmnpqrstuvwxyz23456789".contains(&b)));
+        assert!(
+            p.bytes()
+                .all(|b| b"abcdefghjkmnpqrstuvwxyz23456789".contains(&b))
+        );
     }
 
     #[test]
@@ -261,6 +189,9 @@ mod tests {
         assert!(p.contains_key("802-11-wireless-security"));
         assert!(matches!(&p["802-11-wireless"]["mode"], Value::Str(s) if s.as_str() == "ap"));
         assert!(matches!(&p["ipv4"]["method"], Value::Str(s) if s.as_str() == "shared"));
-        assert!(matches!(&p["connection"]["autoconnect"], Value::Bool(false)));
+        assert!(matches!(
+            &p["connection"]["autoconnect"],
+            Value::Bool(false)
+        ));
     }
 }

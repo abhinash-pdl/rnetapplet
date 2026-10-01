@@ -1,9 +1,11 @@
 [Desktop Entry]
 Name=rnetapplet
 Comment=NetworkManager tray applet for wlroots Wayland compositors
-Exec=rnetapplet
+Exec=sh -c 'for i in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; sleep 0.2; done; if command -v busctl >/dev/null 2>&1; then for i in $(seq 1 50); do busctl --user list 2>/dev/null | grep -q org.freedesktop.portal.Desktop && break; sleep 0.2; done; fi; for i in $(seq 1 50); do [ -n "$WAYLAND_DISPLAY" -o -n "$DISPLAY" ] && break; sleep 0.2; done; for i in $(seq 1 25); do ls /dev/dri/card* >/dev/null 2>&1 && break; sleep 0.2; done; exec rnetapplet'
 Icon=network-wireless-symbolic
 Type=Application
 Categories=System;Network;
+Keywords=wifi;network;wireless;
 NoDisplay=true
-X-GNOME-Autostart-enabled=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

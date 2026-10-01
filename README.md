@@ -23,6 +23,8 @@ connections; everything happens inside the popup.
 - QR-code connect from a webcam or an image file
 - Settings shortcut that opens the system `nm-connection-editor`
 - Tray icon follows the icon theme
+- Saved VPN connections listed with connect/disconnect
+- Manual rescan button plus automatic live updates
 
 ## What it uses
 
@@ -34,7 +36,7 @@ connections; everything happens inside the popup.
 | Tray icon | StatusNotifierItem (via ksni) |
 | NetworkManager API | D-Bus (via zbus / rusty-network-manager) |
 | QR scanning | `rqrr` (decode) and `nokhwa` (webcam capture) |
-| Async runtime | tokio, running on the main thread with GTK |
+| Async runtime | tokio (background multi-thread runtime) |
 
 ## Requirements
 
@@ -43,6 +45,9 @@ connections; everything happens inside the popup.
 - A tray host with StatusNotifierItem support (e.g. the waybar `tray`
   module, swaync)
 - Optional: a webcam for QR-code camera scanning
+- Recommended: `xdg-desktop-portal` (plus the compositor's portal
+  implementation) so the theme, colors and scale are known before the
+  popup first renders
 
 ## Dependencies
 
@@ -85,9 +90,12 @@ install it:
 
 ```sh
 curl -L -o rnetapplet.tar.gz \
-  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.1/rnetapplet-0.1.1-x86_64-linux.tar.gz
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.2/rnetapplet-0.1.2-x86_64-linux.tar.gz
+curl -L -o rnetapplet.tar.gz.sha256 \
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.2/rnetapplet-0.1.2-x86_64-linux.tar.gz.sha256
+sha256sum -c rnetapplet.tar.gz.sha256
 tar xzf rnetapplet.tar.gz
-cd rnetapplet-0.1.1-x86_64-linux
+cd rnetapplet-0.1.2-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
@@ -119,6 +127,15 @@ sudo make install    # installs to /usr/local by default, honours PREFIX/DESTDIR
 Uninstall with `sudo make uninstall`.
 
 ## Autostart
+
+Desktop file (any compositor or desktop; waits for the session bus,
+settings portal, display and GPU before launching, so the theme and
+colors always match):
+
+```sh
+mkdir -p ~/.config/autostart
+cp /usr/share/applications/rnetapplet.desktop ~/.config/autostart/
+```
 
 systemd (works with most compositors):
 

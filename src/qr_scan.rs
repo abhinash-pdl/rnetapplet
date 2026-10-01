@@ -1,15 +1,13 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
-};
-use std::time::Duration;
-
-use gtk4::prelude::*;
-use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-
 use crate::qr::{self, WifiQr};
 use crate::state::BackendCmd;
-
+use gtk4::prelude::*;
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::Duration;
 fn is_virtual_camera(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("virtual")
@@ -18,7 +16,6 @@ fn is_virtual_camera(name: &str) -> bool {
         || n.contains("droidcam")
         || n.contains("manycam")
 }
-
 fn candidate_cameras() -> Result<Vec<(nokhwa::utils::CameraIndex, String)>, String> {
     use nokhwa::utils::ApiBackend;
     let cameras = nokhwa::query(ApiBackend::Video4Linux)
@@ -39,13 +36,11 @@ fn candidate_cameras() -> Result<Vec<(nokhwa::utils::CameraIndex, String)>, Stri
     }
     Ok(ordered)
 }
-
 struct SharedFrame {
     w: u32,
     h: u32,
     rgb: Vec<u8>,
 }
-
 pub async fn file_scan_flow(cmd_tx: async_channel::Sender<BackendCmd>) {
     let dlg = gtk4::FileDialog::new();
     dlg.set_title("Open Wi-Fi QR code image");
@@ -77,21 +72,18 @@ pub async fn file_scan_flow(cmd_tx: async_channel::Sender<BackendCmd>) {
         Err(e) => tracing::warn!("QR decode failed: {e:#}"),
     }
 }
-
 fn scan_gray(gray: &image::GrayImage) -> Option<WifiQr> {
     let mut prepared = rqrr::PreparedImage::prepare(gray.clone());
     for grid in prepared.detect_grids() {
-        if let Ok((_, content)) = grid.decode() {
-            if content.starts_with("WIFI:") {
-                if let Some(qr) = qr::parse_wifi_qr(&content) {
-                    return Some(qr);
-                }
-            }
+        if let Ok((_, content)) = grid.decode()
+            && content.starts_with("WIFI:")
+            && let Some(qr) = qr::parse_wifi_qr(&content)
+        {
+            return Some(qr);
         }
     }
     None
 }
-
 fn stretch_lut(gray: &image::GrayImage) -> [u8; 256] {
     let mut lo = 255u8;
     let mut hi = 0u8;
@@ -116,7 +108,6 @@ fn stretch_lut(gray: &image::GrayImage) -> [u8; 256] {
     }
     lut
 }
-
 fn apply_lut(gray: &image::GrayImage, lut: &[u8; 256]) -> image::GrayImage {
     let mut out = gray.clone();
     for p in out.pixels_mut() {
@@ -124,7 +115,6 @@ fn apply_lut(gray: &image::GrayImage, lut: &[u8; 256]) -> image::GrayImage {
     }
     out
 }
-
 fn decode_gray_variants(gray: &image::GrayImage) -> Option<WifiQr> {
     let lut = stretch_lut(gray);
     let stretched = apply_lut(gray, &lut);
@@ -145,43 +135,87 @@ fn decode_gray_variants(gray: &image::GrayImage) -> Option<WifiQr> {
     }
     scan_gray(gray)
 }
-
-fn work_gray(full: &image::GrayImage) -> image::GrayImage {
-    const MAX_W: u32 = 960;
-    let (w, h) = full.dimensions();
-    if w > MAX_W {
-        let nw = MAX_W;
-        let nh = (h * nw / w).max(1);
-        return image::imageops::resize(full, nw, nh, image::imageops::FilterType::Triangle);
+const DECODE_HZ: u32 = 10;
+const PREVIEW_TICK: Duration = Duration::from_millis(50);
+const WORK_MAX_W: u32 = 960;
+const WORK_MIN_W: u32 = 420;
+const WORK_MAX_H: u32 = 960;
+fn work_dims(w: u32, h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (0, 0);
     }
-    if w < 420 {
-        let s = (640 / w.max(1)).clamp(2, 3);
-        return image::imageops::resize(
-            full,
-            w * s,
-            h * s,
-            image::imageops::FilterType::Triangle,
-        );
+    let (mut tw, mut th) = (w, h);
+    if tw > WORK_MAX_W {
+        th = (th * WORK_MAX_W / tw).max(1);
+        tw = WORK_MAX_W;
     }
-    full.clone()
+    if th > WORK_MAX_H {
+        tw = (tw * WORK_MAX_H / th).max(1);
+        th = WORK_MAX_H;
+    }
+    if tw < WORK_MIN_W {
+        let s = (640 / tw.max(1)).clamp(2, 3);
+        tw *= s;
+        th *= s;
+    }
+    (tw, th)
 }
-
+fn work_gray_from_rgb(rgb: &[u8], w: u32, h: u32) -> Option<image::GrayImage> {
+    if w == 0 || h == 0 || rgb.len() < w as usize * h as usize * 3 {
+        return None;
+    }
+    let (tw, th) = work_dims(w, h);
+    if tw == 0 || th == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; tw as usize * th as usize];
+    let src_w = w as usize;
+    let shrinking = tw < w || th < h;
+    for ty in 0..th as usize {
+        let sy0 = ty * h as usize / th as usize;
+        let sy1 = (((ty + 1) * h as usize) / th as usize)
+            .max(sy0 + 1)
+            .min(h as usize);
+        let row = &mut out[ty * tw as usize..(ty + 1) * tw as usize];
+        for (tx, px) in row.iter_mut().enumerate() {
+            let sx0 = tx * src_w / tw as usize;
+            let sx1 = (((tx + 1) * src_w) / tw as usize).max(sx0 + 1).min(src_w);
+            let luma = if shrinking {
+                let mut sum = 0u32;
+                let mut n = 0u32;
+                for sy in sy0..sy1 {
+                    for sx in sx0..sx1 {
+                        let i = (sy * src_w + sx) * 3;
+                        sum += (rgb[i] as u32 * 299
+                            + rgb[i + 1] as u32 * 587
+                            + rgb[i + 2] as u32 * 114)
+                            / 1000;
+                        n += 1;
+                    }
+                }
+                (sum / n.max(1)) as u8
+            } else {
+                let i = (sy0 * src_w + sx0) * 3;
+                ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000)
+                    as u8
+            };
+            *px = luma;
+        }
+    }
+    image::GrayImage::from_raw(tw, th, out)
+}
 fn try_decode_rgb(rgb: &[u8], w: u32, h: u32) -> Option<WifiQr> {
-    let img = image::RgbImage::from_raw(w, h, rgb.to_vec())?;
-    let gray = image::imageops::grayscale(&img);
-    decode_gray_variants(&work_gray(&gray))
+    decode_gray_variants(&work_gray_from_rgb(rgb, w, h)?)
 }
-
 fn open_camera(
     index: nokhwa::utils::CameraIndex,
     camera_name: &str,
 ) -> Result<nokhwa::Camera, String> {
     use nokhwa::{
+        Camera,
         pixel_format::RgbFormat,
         utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
-        Camera,
     };
-
     let attempts: Vec<(&str, RequestedFormatType)> = vec![
         (
             "720p-mjpeg",
@@ -224,14 +258,17 @@ fn open_camera(
                 return Ok(cam);
             }
             Err(e) => {
-                tracing::warn!(camera = camera_name, format = label, "camera format failed: {e}");
+                tracing::warn!(
+                    camera = camera_name,
+                    format = label,
+                    "camera format failed: {e}"
+                );
                 last_err = format!("{label}: {e}");
             }
         }
     }
     Err(last_err)
 }
-
 fn open_any_camera() -> Result<(nokhwa::Camera, String), String> {
     let candidates = candidate_cameras()?;
     let mut errors = Vec::new();
@@ -241,7 +278,6 @@ fn open_any_camera() -> Result<(nokhwa::Camera, String), String> {
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-
     let nodes = std::fs::read_dir("/dev")
         .map(|rd| {
             let mut v: Vec<String> = rd
@@ -258,11 +294,10 @@ fn open_any_camera() -> Result<(nokhwa::Camera, String), String> {
         errors.join(" | ")
     ))
 }
-
 fn camera_loop(
     stop: Arc<AtomicBool>,
     frames: Arc<Mutex<Option<SharedFrame>>>,
-    res_tx: mpsc::Sender<WifiQr>,
+    work: Arc<Mutex<Option<image::GrayImage>>>,
     status_tx: mpsc::Sender<String>,
 ) {
     use nokhwa::pixel_format::RgbFormat;
@@ -271,12 +306,15 @@ fn camera_loop(
     };
     let (mut cam, _) = match open_any_camera() {
         Ok(c) => c,
-        Err(e) => { say(e); return; }
+        Err(e) => {
+            say(e);
+            return;
+        }
     };
     let mut decode_errors = 0u32;
-    let mut last_preview = std::time::Instant::now() - Duration::from_secs(1);
+    let mut last_work = std::time::Instant::now() - Duration::from_secs(1);
+    let work_every = Duration::from_millis(1000 / DECODE_HZ as u64);
     while !stop.load(Ordering::Relaxed) {
-
         let frame = match cam.frame() {
             Ok(f) => f,
             Err(_) => {
@@ -300,20 +338,38 @@ fn camera_loop(
         if w == 0 || h == 0 || rgb.len() != w as usize * h as usize * 3 {
             continue;
         }
-        if try_decode_rgb(&rgb, w, h).is_some_and(|qr| res_tx.send(qr).is_ok()) {
-            break;
+
+        if last_work.elapsed() >= work_every {
+            last_work = std::time::Instant::now();
+            if let Some(g) = work_gray_from_rgb(&rgb, w, h) {
+                *work.lock().unwrap_or_else(|e| e.into_inner()) = Some(g);
+            }
         }
-        if last_preview.elapsed() > Duration::from_millis(200) {
-            last_preview = std::time::Instant::now();
-            *frames.lock().unwrap_or_else(|e| e.into_inner()) = Some(SharedFrame {
-                w,
-                h,
-                rgb,
-            });
-        }
+
+        *frames.lock().unwrap_or_else(|e| e.into_inner()) = Some(SharedFrame { w, h, rgb });
     }
 }
 
+fn decode_loop(
+    stop: Arc<AtomicBool>,
+    work: Arc<Mutex<Option<image::GrayImage>>>,
+    res_tx: mpsc::Sender<WifiQr>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let gray = work.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(g) = gray else {
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        };
+        if let Some(qr) = decode_gray_variants(&g) {
+            if res_tx.send(qr).is_ok() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 pub fn camera_self_test() -> anyhow::Result<()> {
     use nokhwa::pixel_format::RgbFormat;
     let (mut cam, camera_name) = open_any_camera().map_err(anyhow::Error::msg)?;
@@ -323,7 +379,11 @@ pub fn camera_self_test() -> anyhow::Result<()> {
         let img = frame.decode_image::<RgbFormat>()?;
         let (w, h) = (img.width(), img.height());
         let raw = img.into_raw();
-        println!("frame {i}: {w}x{h} bytes={} ok={}", raw.len(), raw.len() == w as usize * h as usize * 3);
+        println!(
+            "frame {i}: {w}x{h} bytes={} ok={}",
+            raw.len(),
+            raw.len() == w as usize * h as usize * 3
+        );
         if try_decode_rgb(&raw, w, h).is_some() {
             println!("decoded a QR payload");
         }
@@ -366,25 +426,21 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
     window.set_margin(Edge::Right, ((mw - w) / 2).max(0));
     window.set_exclusive_zone(0);
     window.set_keyboard_mode(KeyboardMode::OnDemand);
-
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     vbox.add_css_class("rnet-card");
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
     vbox.set_margin_start(12);
     vbox.set_margin_end(12);
-
     let picture = gtk4::Picture::new();
     picture.set_content_fit(gtk4::ContentFit::Cover);
     picture.set_size_request(456, 400);
     vbox.append(&picture);
-
     let status = gtk4::Label::new(None);
     status.add_css_class("dim-label");
     status.set_halign(gtk4::Align::Start);
     status.set_wrap(true);
     vbox.append(&status);
-
     let btn_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     btn_row.set_halign(gtk4::Align::End);
     let file_btn = gtk4::Button::with_label("Open image file");
@@ -392,19 +448,23 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
     btn_row.append(&file_btn);
     btn_row.append(&close_btn);
     vbox.append(&btn_row);
-
     window.set_child(Some(&vbox));
     window.present();
-
     let stop = Arc::new(AtomicBool::new(false));
     let frames: Arc<Mutex<Option<SharedFrame>>> = Arc::new(Mutex::new(None));
+    let work: Arc<Mutex<Option<image::GrayImage>>> = Arc::new(Mutex::new(None));
     let (res_tx, res_rx) = mpsc::channel::<WifiQr>();
     let (status_tx, status_rx) = mpsc::channel::<String>();
-
     {
         let stop = stop.clone();
         let frames = frames.clone();
-        std::thread::spawn(move || camera_loop(stop, frames, res_tx, status_tx));
+        let work = work.clone();
+        std::thread::spawn(move || camera_loop(stop, frames, work, status_tx));
+    }
+    {
+        let stop = stop.clone();
+        let work = work.clone();
+        std::thread::spawn(move || decode_loop(stop, work, res_tx));
     }
     {
         let stop = stop.clone();
@@ -429,15 +489,13 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
             });
         });
     }
-
     let cmd_tx_tick = cmd_tx.clone();
     let window_tick = window.clone();
-    gtk4::glib::timeout_add_local(Duration::from_millis(120), move || {
+    gtk4::glib::timeout_add_local(PREVIEW_TICK, move || {
         if let Ok(s) = status_rx.try_recv() {
             status.set_text(&s);
         }
         if let Some(f) = frames.lock().unwrap_or_else(|e| e.into_inner()).take() {
-
             let need = f.w as u64 * f.h as u64 * 3;
             if f.w > 0 && f.h > 0 && f.rgb.len() as u64 == need {
                 let bytes = gtk4::glib::Bytes::from_owned(f.rgb);
@@ -468,4 +526,58 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
         }
         gtk4::glib::ControlFlow::Continue
     });
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn work_gray_from_rgb_matches_reference_luma() {
+        let (w, h) = (512u32, 256u32);
+        let mut rgb = vec![0u8; w as usize * h as usize * 3];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = (y * w as usize + x) * 3;
+                let v = ((x * 4 + y * 2) % 256) as u8;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let got = work_gray_from_rgb(&rgb, w, h).unwrap();
+        assert_eq!(got.dimensions(), (w, h));
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let v = ((x * 4 + y * 2) % 256) as u8;
+                assert_eq!(got.get_pixel(x as u32, y as u32)[0], v, "at {x},{y}");
+            }
+        }
+    }
+    #[test]
+    fn work_gray_from_rgb_downsamples_large_frames() {
+        let (w, h) = (1920u32, 1080u32);
+        let rgb = vec![128u8; w as usize * h as usize * 3];
+        let got = work_gray_from_rgb(&rgb, w, h).unwrap();
+        assert_eq!(got.dimensions(), (WORK_MAX_W, 540));
+        assert!(got.pixels().all(|p| p[0] == 128));
+    }
+    #[test]
+    fn work_gray_from_rgb_upscales_tiny_frames() {
+        let (w, h) = (160u32, 120u32);
+        let rgb = vec![200u8; w as usize * h as usize * 3];
+        let got = work_gray_from_rgb(&rgb, w, h).unwrap();
+        assert!(got.width() >= WORK_MIN_W, "got {}", got.width());
+        assert!(got.pixels().all(|p| p[0] == 200));
+    }
+    #[test]
+    fn work_gray_from_rgb_rejects_malformed_input() {
+        assert!(work_gray_from_rgb(&[0; 10], 4, 4).is_none(), "short buffer");
+        assert!(work_gray_from_rgb(&[], 0, 4).is_none(), "zero width");
+    }
+    #[test]
+    fn work_dims_is_bounded_in_both_directions() {
+        assert_eq!(work_dims(1920, 1080), (960, 540));
+        assert_eq!(work_dims(800, 600), (800, 600), "already in range");
+        assert_eq!(work_dims(200, 3000), (192, 2880));
+        assert_eq!(work_dims(0, 100), (0, 0));
+    }
 }

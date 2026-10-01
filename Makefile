@@ -36,7 +36,7 @@ test:
 	cargo test --locked
 
 dist: build-release
-	rm -rf $(DISTDIR) $(DISTBALL)
+	rm -rf $(DISTDIR) $(DISTBALL) $(DISTBALL).sha256
 	mkdir -p $(DISTDIR)
 	install -m755 target/release/$(BIN) $(DISTDIR)/$(BIN)
 	install -m644 packaging/rnetapplet.desktop $(DISTDIR)/
@@ -44,7 +44,7 @@ dist: build-release
 	install -m644 README.md LICENSE-MIT $(DISTDIR)/
 	tar czf $(DISTBALL) $(DISTDIR)
 	rm -rf $(DISTDIR)
-	sha256sum $(DISTBALL)
+	sha256sum $(DISTBALL) | tee $(DISTBALL).sha256
 
 clean:
 	cargo clean
