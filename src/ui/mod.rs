@@ -2,7 +2,7 @@ mod appearance;
 mod hidden;
 mod hotspot;
 mod list;
-mod motion;
+mod notify;
 mod placement;
 mod row;
 mod state;
@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::nm_client::connect::MSG_WRONG_PASSWORD;
 use gtk4::gdk::Key;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -27,9 +28,14 @@ use theme::{header_icon_px, themed_icon};
 
 use crate::state::{BackendCmd, Model, UiEvent};
 
-const POPUP_W: i32 = 415;
-const POPUP_H: i32 = 550;
-const POPUP_MS: u32 = 190;
+const POPUP_W: i32 = 425;
+
+const POPUP_MAX_H: i32 = 530;
+
+const POPUP_MIN_LIST_H: i32 = 96;
+
+mod motion;
+use motion::{MIN_HEIGHT_JITTER, SizeAnim};
 
 const CSS: &str = "
 window.rnet-window, window.rnet-window > .background, window.rnet-window:backdrop, window.rnet-window:backdrop > .background, window.rnet-window.background, window.rnet-window.background:backdrop { background-color: transparent; background-image: none; box-shadow: none; border: none; border-radius: 0; }
@@ -44,6 +50,25 @@ window.rnet-window, window.rnet-window > .background, window.rnet-window:backdro
  .rnet-row:hover { background-color: alpha(@theme_fg_color, 0.08); background-image: none; }
  .rnet-row:active { background-color: alpha(@theme_fg_color, 0.13); background-image: none; }
  .flat { transition: background-color 120ms ease-in-out; }
+ .rnet-chip {
+     padding: 1px 7px;
+     margin-left: 2px;
+     border-radius: 10px;
+     background-image: none;
+     background-color: alpha(@theme_fg_color, 0.14);
+     color: @theme_fg_color;
+     font-size: 0.8em;
+     font-weight: bold;
+ }
+ .rnet-chip-saved {
+     padding: 1px 7px;
+     margin-left: 2px;
+     border-radius: 10px;
+     background-image: none;
+     background-color: alpha(@theme_fg_color, 0.09);
+     color: alpha(@theme_fg_color, 0.75);
+     font-size: 0.8em;
+ }
  .rnet-popover { padding: 14px; }
  .rnet-hotspot-key { font-family: monospace; }
  .rnet-status { padding-top: 6px; }
@@ -58,13 +83,71 @@ window.rnet-window, window.rnet-window > .background, window.rnet-window:backdro
 .rnet-lock-badge { background-color: @theme_base_color; border-radius: 999px; padding: 0.5px; }
 ";
 
-pub(crate) fn apply_popup_size(revealer: &gtk4::Revealer, card: &gtk4::Box, scale: i32) {
+fn measure_chrome(
+    card: &gtk4::Box,
+    list_scroll: &gtk4::ScrolledWindow,
+    w: i32,
+    min_list: i32,
+) -> i32 {
+    card.set_size_request(w, -1);
+    list_scroll.set_size_request(-1, min_list);
+    let (_, at_floor, _, _) = card.measure(gtk4::Orientation::Vertical, w);
+    (at_floor - min_list).max(0)
+}
+
+fn scale_limits(scale: i32) -> (i32, i32, i32) {
     let s = scale.max(1);
-    let w = (POPUP_W as f64 / s as f64).ceil() as i32;
-    let h = (POPUP_H as f64 / s as f64).ceil() as i32;
-    tracing::debug!(scale = s, w, h, "popup size applied");
+    (
+        (POPUP_W as f64 / s as f64).ceil() as i32,
+        (POPUP_MAX_H as f64 / s as f64).ceil() as i32,
+        (POPUP_MIN_LIST_H as f64 / s as f64).ceil() as i32,
+    )
+}
+
+pub(crate) fn measure_popup(
+    card: &gtk4::Box,
+    list_scroll: &gtk4::ScrolledWindow,
+    scale: i32,
+    chrome: i32,
+) -> (i32, i32, i32) {
+    let (w, max_h, min_list) = scale_limits(scale);
+    let (_, natural_w, _, _) = card.measure(gtk4::Orientation::Horizontal, -1);
+    if natural_w > w {
+        tracing::warn!(
+            natural = natural_w,
+            requested = w,
+            "popup content wants more width than requested; it would show wider"
+        );
+    }
+    let rows_natural = list_scroll
+        .child()
+        .map(|c| c.measure(gtk4::Orientation::Vertical, w).1)
+        .unwrap_or(0);
+    let list_room = (max_h - chrome).max(min_list);
+    let list_h = rows_natural.clamp(min_list, list_room);
+    (w, (chrome + list_h).min(max_h), list_h)
+}
+
+pub(crate) fn apply_popup_height(
+    revealer: &gtk4::Revealer,
+    card: &gtk4::Box,
+    list_scroll: &gtk4::ScrolledWindow,
+    w: i32,
+    h: i32,
+    list_h: i32,
+    max_h: i32,
+) {
     card.set_size_request(w, h);
     revealer.set_size_request(w, -1);
+    list_scroll.set_size_request(-1, list_h);
+    tracing::debug!(
+        w,
+        h,
+        list_h,
+        max_h,
+        card_ah = card.height(),
+        "popup height pinned"
+    );
 }
 
 pub(crate) fn load_css() {
@@ -113,10 +196,7 @@ pub fn run(
         let query = Rc::new(RefCell::new(String::new()));
         let visible = Rc::new(Cell::new(false));
         let prog_guard = Rc::new(Cell::new(false));
-        let expanded: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let errors: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
-        let err_token: Rc<RefCell<HashMap<String, std::time::Instant>>> =
-            Rc::new(RefCell::new(HashMap::new()));
         let pw_drafts: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
         let focus_ssid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let pending_secret_paths: Rc<RefCell<HashMap<String, String>>> =
@@ -142,11 +222,12 @@ pub fn run(
             Rc::new(RefCell::new(HashMap::new()));
         let chevrons: Rc<RefCell<HashMap<String, gtk4::Image>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let connect_btns: Rc<RefCell<HashMap<String, gtk4::Button>>> =
+        let rows: Rc<RefCell<HashMap<String, gtk4::ListBoxRow>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let submits: Rc<RefCell<HashMap<String, gtk4::Button>>> =
-            Rc::new(RefCell::new(HashMap::new()));
-        let flips: Rc<RefCell<HashMap<String, std::rc::Rc<motion::Flip>>>> =
+        let action_btns: Rc<RefCell<HashMap<String, state::ActionBtn>>> = Default::default();
+        let card_actions: Rc<RefCell<HashMap<String, gtk4::Box>>> = Default::default();
+        let status: Rc<RefCell<HashMap<String, gtk4::Box>>> = Rc::new(RefCell::new(HashMap::new()));
+        let error_labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let ssid_labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
             Rc::new(RefCell::new(HashMap::new()));
@@ -212,18 +293,6 @@ pub fn run(
                     }
                 }
             }
-        }
-
-        {
-            let visible = visible.clone();
-            let flag = popup_visible.clone();
-            let hide_window = window.clone();
-            window.connect_close_request(move |_| {
-                visible.set(false);
-                flag.store(false, Ordering::Relaxed);
-                hide_window.set_visible(false);
-                gtk4::glib::Propagation::Stop
-            });
         }
 
         let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -323,6 +392,8 @@ pub fn run(
         let search = gtk4::SearchEntry::new();
         search.set_placeholder_text(Some("Search..."));
         search.set_width_chars(2);
+
+        search.set_max_width_chars(11);
         search.set_hexpand(true);
         search.set_margin_end(10);
         toolbar.append(&search);
@@ -343,9 +414,14 @@ pub fn run(
 
         let scroll = gtk4::ScrolledWindow::new();
         scroll.set_vexpand(true);
-        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+
+        scroll.set_propagate_natural_width(false);
         scroll.set_overlay_scrolling(true);
+
+        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+
         scroll.vscrollbar().set_visible(false);
+        scroll.hscrollbar().set_visible(false);
         let list = gtk4::ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::None);
         scroll.set_child(Some(&list));
@@ -360,22 +436,136 @@ pub fn run(
 
         let popup_revealer = gtk4::Revealer::new();
         popup_revealer.set_transition_type(gtk4::RevealerTransitionType::Crossfade);
-        popup_revealer.set_transition_duration(POPUP_MS);
+        popup_revealer.set_transition_duration(motion::REVEAL_MS);
+        popup_revealer.set_reveal_child(false);
         popup_revealer.set_child(Some(&vbox));
         popup_revealer.set_halign(gtk4::Align::End);
         popup_revealer.set_valign(gtk4::Align::Start);
-        apply_popup_size(&popup_revealer, &vbox, output_scale_for_x(None));
         overlay.add_overlay(&popup_revealer);
 
+        let expanded = Rc::new(std::cell::RefCell::new(None::<String>));
+        let extra_heights = Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
+            String,
+            i32,
+        >::new()));
+        let popup_scale = Rc::new(std::cell::Cell::new(output_scale_for_x(None)));
+        let applied_w = Rc::new(std::cell::Cell::new(0));
+        let applied_h = Rc::new(std::cell::Cell::new(0));
+        let base_list_h = Rc::new(std::cell::Cell::new(0));
+        let anim_until = Rc::new(std::cell::Cell::new(0i64));
+
+        let chrome = Rc::new(std::cell::Cell::new(0));
+        {
+            let (w, max_h, min_list) = scale_limits(popup_scale.get());
+            chrome.set(measure_chrome(&vbox, &scroll, w, min_list));
+            let (w, h, list_h) = measure_popup(&vbox, &scroll, popup_scale.get(), chrome.get());
+            applied_w.set(w);
+            applied_h.set(h);
+            apply_popup_height(&popup_revealer, &vbox, &scroll, w, h, list_h, max_h);
+        }
+
+        let size = {
+            let rev = popup_revealer.clone();
+            let card = vbox.clone();
+            let sc = scroll.clone();
+            let scale = popup_scale.clone();
+            let applied = applied_h.clone();
+            let chrome = chrome.clone();
+            let apply: Rc<dyn Fn(i32)> = Rc::new(move |h| {
+                let (w, max_h, min_list) = scale_limits(scale.get());
+                let list_h = (h - chrome.get()).max(min_list);
+                apply_popup_height(&rev, &card, &sc, w, h, list_h, max_h);
+                applied.set(h);
+            });
+            SizeAnim::new(&vbox, apply)
+        };
+
+        let grow: Rc<dyn Fn(i32)> = {
+            let scale = popup_scale.clone();
+            let chrome = chrome.clone();
+            let base = base_list_h.clone();
+            let size = size.clone();
+            Rc::new(move |reserved| {
+                let (_, max_h, min_list) = scale_limits(scale.get());
+                let ch = chrome.get();
+                let want = (base.get().max(min_list) + ch + reserved).clamp(min_list + ch, max_h);
+                if want != size.to.get() {
+                    size.run(want);
+                }
+            })
+        };
+
+        let fit: Rc<dyn Fn()> = {
+            let card = vbox.clone();
+            let expanded2 = expanded.clone();
+            let base2 = base_list_h.clone();
+            let sc = scroll.clone();
+            let scale = popup_scale.clone();
+            let busy = anim_until.clone();
+            let chrome = chrome.clone();
+            let size = size.clone();
+            let shown = visible.clone();
+            let dirty = Rc::new(Cell::new(false));
+            let queued = Rc::new(Cell::new(false));
+            let last = Rc::new(Cell::new(0i64));
+            Rc::new(move || {
+                if !shown.get() {
+                    return;
+                }
+                dirty.set(true);
+                if queued.get() {
+                    return;
+                }
+                queued.set(true);
+                let (card2, sc2) = (card.clone(), sc.clone());
+                let (dirty2, queued2, last2) = (dirty.clone(), queued.clone(), last.clone());
+                let (expanded3, base3) = (expanded2.clone(), base2.clone());
+                let (scale2, busy2, chrome2) = (scale.get(), busy.clone(), chrome.get());
+                let size2 = size.clone();
+                gtk4::glib::idle_add_local_once(move || {
+                    let now = motion::now_ms();
+                    let wait = (motion::FIT_GAP_MS - (now - last2.get())).max(0);
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(wait as u64),
+                        move || {
+                            queued2.set(false);
+                            if !dirty2.get() {
+                                return;
+                            }
+
+                            if expanded3.borrow().is_some() || motion::now_ms() < busy2.get() {
+                                return;
+                            }
+                            dirty2.set(false);
+                            let (_, measured, list_h) =
+                                measure_popup(&card2, &sc2, scale2, chrome2);
+                            let (_, max_h, min_list) = scale_limits(scale2);
+                            let want = measured.clamp(min_list + chrome2, max_h);
+                            let diff = want - size2.to.get();
+                            if diff.abs() < MIN_HEIGHT_JITTER {
+                                return;
+                            }
+                            base3.set(list_h);
+                            size2.run(want);
+                            last2.set(motion::now_ms());
+                            tracing::debug!(diff, want, base = list_h, "popup refitted to rows");
+                        },
+                    );
+                });
+            })
+        };
         let h = UiHandles {
+            fit,
+            grow,
+            extra_heights: extra_heights.clone(),
+            anim_until,
+            scroll: scroll.clone(),
             list: list.clone(),
             root: window.clone().upcast(),
-            scroll: scroll.clone(),
             model: model.clone(),
             query: query.clone(),
             expanded: expanded.clone(),
             errors: errors.clone(),
-            err_token: err_token.clone(),
             focus_ssid: focus_ssid.clone(),
             pw_drafts: pw_drafts.clone(),
             connecting: connecting.clone(),
@@ -395,9 +585,11 @@ pub fn run(
             speed_labels: speed_labels.clone(),
             revealers: revealers.clone(),
             chevrons: chevrons.clone(),
-            connect_btns: connect_btns.clone(),
-            submits: submits.clone(),
-            flips: flips.clone(),
+            rows: rows.clone(),
+            action_btns: action_btns.clone(),
+            card_actions: card_actions.clone(),
+            status: status.clone(),
+            error_labels: error_labels.clone(),
             ssid_labels: ssid_labels.clone(),
             pw_entries: pw_entries.clone(),
             strength_setters: strength_setters.clone(),
@@ -411,6 +603,7 @@ pub fn run(
             scan_frozen: scan_frozen.clone(),
             pending_model: Rc::new(RefCell::new(None)),
             pending_rebuild: pending_rebuild.clone(),
+            rebuild_queued: Rc::new(Cell::new(false)),
             last_strengths: Rc::new(RefCell::new(HashMap::new())),
             ap_misses: Rc::new(RefCell::new(HashMap::new())),
             cmd_tx: cmd_tx.clone(),
@@ -418,18 +611,37 @@ pub fn run(
         *h.search_entry.borrow_mut() = Some(search.clone().upcast());
 
         {
+            let visible = visible.clone();
+            let flag = popup_visible.clone();
             let window_c = window.clone();
             let revealer_c = popup_revealer.clone();
-            let visible_c = visible.clone();
-            let flag_c = popup_visible.clone();
+            let size_c = size.clone();
             let hide_gen_c = hide_gen.clone();
             let h_c = h.clone();
+            window.connect_close_request(move |_| {
+                if visible.get() {
+                    flag.store(false, Ordering::Relaxed);
+                    hide_popup(&window_c, &revealer_c, &size_c, &visible, &hide_gen_c);
+                    list::schedule_teardown(&h_c);
+                }
+                gtk4::glib::Propagation::Stop
+            });
+        }
+
+        {
+            let window_b = window.clone();
+            let revealer_b = popup_revealer.clone();
+            let size_b = size.clone();
+            let visible_b = visible.clone();
+            let flag_b = popup_visible.clone();
+            let hide_gen_b = hide_gen.clone();
+            let h_b = h.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.connect_pressed(move |_, _, _, _| {
-                if visible_c.get() {
-                    flag_c.store(false, Ordering::Relaxed);
-                    hide_popup(&window_c, &revealer_c, &visible_c, &hide_gen_c);
-                    list::schedule_teardown(&h_c);
+                if visible_b.get() {
+                    flag_b.store(false, Ordering::Relaxed);
+                    hide_popup(&window_b, &revealer_b, &size_b, &visible_b, &hide_gen_b);
+                    list::schedule_teardown(&h_b);
                 }
             });
             backdrop.add_controller(gesture);
@@ -549,7 +761,7 @@ pub fn run(
             let h = h.clone();
             search.connect_search_changed(move |entry| {
                 *h.query.borrow_mut() = entry.text().to_string();
-                refresh_list(&h);
+                list::request_rebuild_coalesced(&h);
             });
         }
 
@@ -566,13 +778,23 @@ pub fn run(
         {
             let rev_s = popup_revealer.clone();
             let vbox_s = vbox.clone();
+            let scroll_s = scroll.clone();
+            let scale_s = popup_scale.clone();
+            let chrome_s = chrome.clone();
+            let applied_s = applied_h.clone();
             window.connect_scale_factor_notify(move |w| {
-                apply_popup_size(&rev_s, &vbox_s, w.scale_factor());
+                let scale = w.scale_factor();
+                scale_s.set(scale);
+                let (width, h, list_h) = measure_popup(&vbox_s, &scroll_s, scale, chrome_s.get());
+                let (_, max_h, _) = scale_limits(scale);
+                applied_s.set(h);
+                apply_popup_height(&rev_s, &vbox_s, &scroll_s, width, h, list_h, max_h);
             });
         }
         {
             let window_e = window.clone();
             let revealer_e = popup_revealer.clone();
+            let size_e = size.clone();
             let visible_e = visible.clone();
             let flag_e = popup_visible.clone();
             let hide_gen_e = hide_gen.clone();
@@ -581,7 +803,7 @@ pub fn run(
             keys.connect_key_pressed(move |_, key, _, _| {
                 if key == Key::Escape {
                     flag_e.store(false, Ordering::Relaxed);
-                    hide_popup(&window_e, &revealer_e, &visible_e, &hide_gen_e);
+                    hide_popup(&window_e, &revealer_e, &size_e, &visible_e, &hide_gen_e);
                     list::schedule_teardown(&h_e);
                     gtk4::glib::Propagation::Stop
                 } else {
@@ -634,6 +856,20 @@ pub fn run(
                             air_icon.set_opacity(if m.airplane_mode() { 1.0 } else { 0.5 });
                             let hs_active = UiHandles::hotspot_active(&m);
 
+                            {
+                                let prev = h.model.borrow().active_ssid.clone();
+                                if prev.as_deref() != m.active_ssid.as_deref() {
+                                    match m.active_ssid.as_deref() {
+                                        Some(ssid) => notify::send("Connected", ssid),
+                                        None => {
+                                            if let Some(was) = prev.as_deref() {
+                                                notify::send("Disconnected", was);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if let Some(active) = m.active_ssid.as_deref() {
                                 h.focus_ssid.borrow_mut().take();
                                 h.errors.borrow_mut().remove(active);
@@ -641,7 +877,6 @@ pub fn run(
                                 h.pw_attempt.borrow_mut().remove(active);
                                 h.unsaved_attempt.borrow_mut().remove(active);
                                 h.pw_drafts.borrow_mut().remove(active);
-                                h.err_token.borrow_mut().remove(active);
                             }
 
                             let was_active = UiHandles::hotspot_active(&h.model.borrow());
@@ -679,32 +914,42 @@ pub fn run(
                                         .borrow_mut()
                                         .insert(ssid.clone(), path);
                                 }
-                                h.pw_drafts.borrow_mut().remove(&ssid);
-                                *h.expanded.borrow_mut() = Some(ssid.clone());
-                                *h.focus_ssid.borrow_mut() = Some(ssid);
-                                request_rebuild(&h);
+
+                                if let Some(entry) = h.pw_entries.borrow().get(&ssid).cloned() {
+                                    let typed = entry.text().to_string();
+                                    h.pw_drafts.borrow_mut().insert(ssid.clone(), typed);
+                                }
+                                row::flash_error(&h, &ssid, MSG_WRONG_PASSWORD);
+                                row::set_expanded(&h, Some(&ssid));
                             } else {
                                 h.errors.borrow_mut().remove(&ssid);
-                                h.err_token.borrow_mut().remove(&ssid);
+                                row::show_error_label(&h, &ssid, None);
                                 h.pending_secret_paths
                                     .borrow_mut()
                                     .insert(ssid.clone(), path);
-                                *h.expanded.borrow_mut() = Some(ssid.clone());
-                                *h.focus_ssid.borrow_mut() = Some(ssid);
-                                request_rebuild(&h);
+                                row::set_expanded(&h, Some(&ssid));
                             }
                         }
                         UiEvent::SsidError { ssid, message } => {
                             h.connecting.borrow_mut().remove(&ssid);
                             h.pw_attempt.borrow_mut().remove(&ssid);
                             h.unsaved_attempt.borrow_mut().remove(&ssid);
-                            *h.expanded.borrow_mut() = Some(ssid.clone());
-                            *h.focus_ssid.borrow_mut() = Some(ssid.clone());
-                            row::flash_error(&h, &ssid, &message);
+                            if h.ssid_labels.borrow().contains_key(&ssid) {
+                                row::flash_error(&h, &ssid, &message);
+                                row::set_expanded(&h, Some(&ssid));
+                            } else {
+                                tracing::info!(%ssid, "connect failed: {message}");
+                                *h.hidden_error.borrow_mut() =
+                                    Some(format!("Failed to connect to \u{201c}{ssid}\u{201d}"));
+                                request_rebuild(&h);
+                            }
                         }
                         UiEvent::BackendError(message) => {
                             *h.hotspot_error.borrow_mut() = Some(message);
                             request_rebuild(&h);
+                        }
+                        UiEvent::ExpandRow(ssid) => {
+                            row::set_expanded(&h, Some(&ssid));
                         }
                         UiEvent::Speeds { up_bps, down_bps } => {
                             *h.speeds.borrow_mut() = (up_bps, down_bps);
@@ -735,18 +980,14 @@ pub fn run(
                 while let Ok(pos) = toggle_rx.recv().await {
                     if visible.get() {
                         flag.store(false, Ordering::Relaxed);
-                        hide_popup(&window, &popup_revealer, &visible, &hide_gen);
+                        hide_popup(&window, &popup_revealer, &size, &visible, &hide_gen);
                         list::schedule_teardown(&h_open);
                         continue;
-                    }
-                    if let Some((x, _y)) = pos {
-                        place_near(&popup_revealer, x);
                     }
                     *h_open.expanded.borrow_mut() = None;
                     h_open.focus_ssid.borrow_mut().take();
                     h_open.connecting.borrow_mut().clear();
                     h_open.errors.borrow_mut().clear();
-                    h_open.err_token.borrow_mut().clear();
                     h_open.pw_drafts.borrow_mut().clear();
                     h_open.pending_secret_paths.borrow_mut().clear();
                     h_open.pw_attempt.borrow_mut().clear();
@@ -762,31 +1003,35 @@ pub fn run(
 
                     visible.set(true);
                     flag.store(true, Ordering::Relaxed);
+                    {
+                        let tx = h_open.cmd_tx.clone();
+                        gtk4::glib::idle_add_local_once(move || {
+                            let _ = tx.try_send(crate::state::BackendCmd::Rescan);
+                        });
+                    }
+                    let entry = if pos.is_some() { "tray" } else { "ipc" };
+                    let scale = output_scale_for_x(pos.map(|(x, _)| x));
+                    tracing::debug!(entry, scale, "opening popup");
+                    popup_scale.set(scale);
+                    refresh_list(&h_open);
+                    let (w, final_h, _) = measure_popup(&vbox_open, &scroll, scale, chrome.get());
+                    applied_w.set(w);
+                    applied_h.set(final_h);
+                    size.snap(final_h);
+                    if let Some((x, y)) = pos {
+                        place_near(&popup_revealer, x, y, w, final_h);
+                    }
+                    *expanded.borrow_mut() = None;
+                    extra_heights.borrow_mut().clear();
+                    h_open.anim_until.set(0);
+                    (h_open.fit)();
+
                     window.set_visible(true);
                     window.present();
-                    apply_popup_size(
-                        &popup_revealer,
-                        &vbox_open,
-                        output_scale_for_x(pos.map(|(x, _)| x)),
-                    );
-                    {
-                        let rev_a = popup_revealer.clone();
-                        gtk4::glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(500),
-                            move || {
-                                tracing::debug!(
-                                    alloc_w = rev_a.width(),
-                                    alloc_h = rev_a.height(),
-                                    "popup allocated"
-                                );
-                            },
-                        );
-                    }
-                    hide_gen.set(hide_gen.get() + 1);
 
-                    refresh_list(&h_open);
                     let _ = tx_open.try_send(BackendCmd::Rescan);
 
+                    hide_gen.set(hide_gen.get() + 1);
                     popup_revealer.set_reveal_child(false);
                     {
                         let v = visible.clone();

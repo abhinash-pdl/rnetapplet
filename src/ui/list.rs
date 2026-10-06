@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 
 use super::hidden::ensure_hidden_card;
 use super::hotspot::{hotspot_section_row, hotspot_shown};
-use super::row::{ActiveInfo, ap_row, expander, section_label};
+use super::row::{ActiveInfo, ap_row, expander, section_label, wired_row};
 use super::state::{UiHandles, structural_change};
 use super::vpn::vpn_row;
 use crate::state::{Ap, Model};
@@ -50,17 +50,52 @@ pub(crate) fn merge_ap_sets(
             misses.remove(&ap.ssid);
         }
     }
+    crate::state::sort_aps(&mut out);
     out
 }
 
 pub(crate) fn filter_aps<'a>(aps: &'a [Ap], query: &str) -> Vec<&'a Ap> {
-    let q = query.trim().to_lowercase();
+    let q = query.trim();
     if q.is_empty() {
         return aps.iter().collect();
     }
+    let q = q.to_lowercase();
     aps.iter()
         .filter(|ap| ap.ssid.to_lowercase().contains(&q))
         .collect()
+}
+
+fn wifi_off_row(h: &UiHandles, airplane: bool) -> gtk4::ListBoxRow {
+    let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    holder.set_margin_top(18);
+    holder.set_margin_bottom(18);
+    holder.set_margin_start(16);
+    holder.set_margin_end(16);
+
+    let msg = if airplane {
+        "Wi-Fi is off while Airplane mode is on"
+    } else {
+        "Wi-Fi is off"
+    };
+    let label = gtk4::Label::new(Some(msg));
+    label.add_css_class("dim-label");
+    holder.append(&label);
+
+    if !airplane {
+        let turn_on = gtk4::Button::with_label("Turn On");
+        turn_on.set_halign(gtk4::Align::Center);
+        let tx = h.cmd_tx.clone();
+        turn_on.connect_clicked(move |_| {
+            let _ = tx.try_send(crate::state::BackendCmd::SetWifi(true));
+        });
+        holder.append(&turn_on);
+    }
+
+    let row = gtk4::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
+    row.set_child(Some(&holder));
+    row
 }
 
 pub(crate) fn animated_card(rows: Vec<gtk4::Widget>) -> gtk4::ListBoxRow {
@@ -74,7 +109,7 @@ pub(crate) fn animated_card(rows: Vec<gtk4::Widget>) -> gtk4::ListBoxRow {
     inner.set_child(Some(&holder));
     let rev = gtk4::Revealer::new();
     rev.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    rev.set_transition_duration(130);
+    rev.set_transition_duration(crate::ui::motion::REVEAL_MS);
     rev.set_child(Some(&inner));
     rev.set_reveal_child(false);
     gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(8), {
@@ -95,6 +130,72 @@ pub(crate) fn update_strengths(h: &UiHandles, m: &Model) {
             set(ap.strength);
         }
     }
+}
+
+pub(crate) fn reorder_rows(h: &UiHandles, wanted: &[String]) -> bool {
+    let rows = h.rows.borrow();
+    if rows.is_empty() {
+        return false;
+    }
+    let owner = |w: &gtk4::Widget| -> Option<String> {
+        rows.iter()
+            .find(|(_, r)| r.upcast_ref::<gtk4::Widget>() == w)
+            .map(|(s, _)| s.clone())
+    };
+    let mut children: Vec<gtk4::Widget> = Vec::new();
+    let mut child = h.list.first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        children.push(c.upcast());
+    }
+    let slots: Vec<(usize, String)> = children
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| owner(w).map(|s| (i, s)))
+        .collect();
+    if slots.len() != wanted.len() {
+        return false;
+    }
+    if slots
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .eq(wanted.iter().map(String::as_str))
+    {
+        return false;
+    }
+    let reordered: Vec<gtk4::ListBoxRow> =
+        wanted.iter().filter_map(|s| rows.get(s)).cloned().collect();
+    if reordered.len() != wanted.len() {
+        return false;
+    }
+    let focus = rows
+        .iter()
+        .find(|(_, r)| r.is_focus())
+        .map(|(_, r)| r.clone());
+    for (i, _) in &slots {
+        h.list.remove(&children[*i]);
+    }
+    for (n, (i, _)) in slots.iter().enumerate() {
+        h.list.insert(&reordered[n], *i as i32);
+    }
+    if let Some(row) = focus
+        && reordered.contains(&row)
+    {
+        row.grab_focus();
+    }
+    tracing::debug!(moved = reordered.len(), "rows reordered in place");
+    true
+}
+
+fn wanted_order(h: &UiHandles, m: &Model) -> Vec<String> {
+    let q = h.query.borrow().clone();
+    let v = visible(m, &q);
+    let mut out: Vec<String> = Vec::new();
+    if let Some(ap) = v.connected {
+        out.push(ap.ssid.clone());
+    }
+    out.extend(v.available.iter().map(|ap| ap.ssid.clone()));
+    out
 }
 
 fn ingest(h: &UiHandles, m: Arc<Model>) {
@@ -122,9 +223,10 @@ fn ingest(h: &UiHandles, m: Arc<Model>) {
             )
         }
     };
+    let live: HashSet<&str> = merged.iter().map(|a| a.ssid.as_str()).collect();
     h.last_strengths
         .borrow_mut()
-        .retain(|ssid, _| merged.iter().any(|a| &a.ssid == ssid));
+        .retain(|ssid, _| live.contains(ssid.as_str()));
     let mut stored = m.as_ref().clone();
     stored.aps = merged.into();
     *h.model.borrow_mut() = Arc::new(stored);
@@ -151,8 +253,12 @@ pub(crate) fn apply_model(h: &UiHandles, m: Arc<Model>) {
     let structural = structural_change(&old, &h.model.borrow());
     if structural {
         request_rebuild(h);
-    } else {
-        update_strengths(h, &h.model.borrow());
+        return;
+    }
+    let now = h.model.borrow().clone();
+    update_strengths(h, &now);
+    if reorder_rows(h, &wanted_order(h, &now)) {
+        h.prune_drafts();
     }
 }
 
@@ -161,17 +267,33 @@ pub(crate) fn request_rebuild(h: &UiHandles) {
         h.pending_rebuild.set(true);
         return;
     }
+    if h.rebuild_queued.replace(true) {
+        return;
+    }
+    let h = h.clone();
+    gtk4::glib::idle_add_local_once(move || {
+        h.rebuild_queued.set(false);
+        if h.refresh_blocked() || !h.visible.get() {
+            h.pending_rebuild.set(true);
+            return;
+        }
+        refresh_list(&h);
+    });
+}
 
-    refresh_list(h);
+pub(crate) fn request_rebuild_coalesced(h: &UiHandles) {
+    request_rebuild(h);
 }
 
 pub(crate) fn reset_rows(h: &UiHandles) {
+    h.rows.borrow_mut().clear();
     h.revealers.borrow_mut().clear();
     h.chevrons.borrow_mut().clear();
-    crate::ui::motion::settle(h);
-    h.connect_btns.borrow_mut().clear();
-    h.submits.borrow_mut().clear();
-    h.flips.borrow_mut().clear();
+    h.status.borrow_mut().clear();
+
+    h.action_btns.borrow_mut().clear();
+    h.card_actions.borrow_mut().clear();
+    h.error_labels.borrow_mut().clear();
     h.ssid_labels.borrow_mut().clear();
     h.pw_entries.borrow_mut().clear();
     h.hotspot_entries.borrow_mut().clear();
@@ -180,10 +302,10 @@ pub(crate) fn reset_rows(h: &UiHandles) {
 }
 
 pub(crate) fn teardown(h: &UiHandles) {
+    reset_rows(h);
     while let Some(child) = h.list.first_child() {
         h.list.remove(&child);
     }
-    reset_rows(h);
     *h.hidden_card.borrow_mut() = None;
     h.hidden_expanded.set(false);
     h.hidden_closing.set(false);
@@ -198,14 +320,11 @@ pub(crate) fn teardown(h: &UiHandles) {
 
 pub(crate) fn schedule_teardown(h: &UiHandles) {
     let h = h.clone();
-    gtk4::glib::timeout_add_local_once(
-        std::time::Duration::from_millis(super::POPUP_MS as u64 + 50),
-        move || {
-            if !h.visible.get() {
-                teardown(&h);
-            }
-        },
-    );
+    gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+        if !h.visible.get() {
+            teardown(&h);
+        }
+    });
 }
 
 pub(crate) fn restore_focus(h: &UiHandles) {
@@ -274,10 +393,10 @@ pub(crate) fn refresh_list(h: &UiHandles) {
     let adj = h.scroll.vadjustment();
     let saved_pos = adj.value();
 
+    reset_rows(h);
     while let Some(child) = h.list.first_child() {
         h.list.remove(&child);
     }
-    reset_rows(h);
 
     let m = h.model.borrow().clone();
     let q = h.query.borrow().clone();
@@ -312,6 +431,11 @@ pub(crate) fn refresh_list(h: &UiHandles) {
         }
     }
 
+    if let Some(wired) = m.wired.as_ref() {
+        h.list.append(&section_label("Wired"));
+        h.list.append(&wired_row(wired, h));
+    }
+
     if hotspot_shown(h) {
         let hs_first = !h.hotspot_was.replace(true);
         if hs_first {
@@ -337,48 +461,65 @@ pub(crate) fn refresh_list(h: &UiHandles) {
             ssid: ssid.to_string(),
             strength,
             secured: true,
+            enterprise: false,
+            wep: false,
+            freq_mhz: None,
+            bands: v
+                .connected
+                .map(|ap| crate::nm_client::aps::band_bit(ap.freq_mhz))
+                .unwrap_or(0),
             saved: true,
+            known: true,
             priority: 0,
         };
         let ap = v.connected.unwrap_or(&synthetic);
         h.list.append(&section_label("Connected"));
         let is_exp = exp.as_deref() == Some(ssid);
-        h.list.append(&ap_row(
+        let dns = m.active_dns.join(", ");
+        let connected_row = ap_row(
             ap,
             true,
             ActiveInfo {
                 iface: m.active_iface.as_deref(),
                 ipv4: m.active_ipv4.as_deref(),
+                gateway: m.active_gateway.as_deref(),
+                dns: (!dns.is_empty()).then_some(dns.as_str()),
+                freq_mhz: m.active_freq_mhz,
             },
             is_exp,
             None,
             h,
             se.clone(),
-        ));
+        );
+        h.rows
+            .borrow_mut()
+            .insert(ssid.to_string(), connected_row.clone());
+        h.list.append(&connected_row);
     }
 
+    let wifi_off = !m.wifi_enabled;
     let n_available = v.available.len();
-    if n_available > 0 || v.active.is_none() {
-        h.list.append(&section_label("Available"));
+    if wifi_off {
+        h.list.append(&wifi_off_row(h, m.airplane_mode()));
+    } else {
+        if n_available > 0 || v.active.is_none() {
+            h.list.append(&section_label("Available"));
+        }
+        if n_available == 0 {
+            let l = gtk4::Label::new(Some("No networks found"));
+            l.add_css_class("dim-label");
+            l.set_margin_top(16);
+            h.list.append(&l);
+        }
     }
-    if n_available == 0 {
-        let l = gtk4::Label::new(Some("No networks found"));
-        l.add_css_class("dim-label");
-        l.set_margin_top(16);
-        h.list.append(&l);
-    }
-    for ap in v.available {
-        let is_exp = exp.as_deref() == Some(ap.ssid.as_str());
-        let err = errs.get(&ap.ssid).cloned();
-        h.list.append(&ap_row(
-            ap,
-            false,
-            ActiveInfo::none(),
-            is_exp,
-            err,
-            h,
-            se.clone(),
-        ));
+    if !wifi_off {
+        for ap in &v.available {
+            let is_exp = exp.as_deref() == Some(ap.ssid.as_str());
+            let err = errs.get(&ap.ssid).cloned();
+            let row = ap_row(ap, false, ActiveInfo::none(), is_exp, err, h, se.clone());
+            h.rows.borrow_mut().insert(ap.ssid.clone(), row.clone());
+            h.list.append(&row);
+        }
     }
 
     let adj2 = adj.clone();
@@ -419,6 +560,7 @@ pub(crate) fn refresh_list(h: &UiHandles) {
         child = c.next_sibling();
     }
     tracing::debug!(rows, active = ?h.model.borrow().active_ssid, "list rebuilt");
+    (h.fit)();
 }
 
 #[cfg(test)]
@@ -430,7 +572,12 @@ mod tests {
             ssid: ssid.into(),
             strength,
             secured: true,
+            enterprise: false,
+            wep: false,
+            freq_mhz: None,
+            bands: 0,
             saved: false,
+            known: false,
             priority: 0,
         }
     }
@@ -471,6 +618,17 @@ mod tests {
     }
 
     #[test]
+    fn merge_puts_the_stronger_network_first() {
+        let current = vec![ap("Home", 60), ap("Cafe", 40)];
+        let loud = vec![ap("Home", 30), ap("Cafe", 90)];
+        let (mut misses, known) = merge_ctx();
+        assert_eq!(
+            ssids(&merge_ap_sets(&current, &loud, None, &mut misses, &known)),
+            ["Cafe", "Home"]
+        );
+    }
+
+    #[test]
     fn merge_updates_strengths_and_adds_new_immediately() {
         let current = vec![ap("Home", 60), ap("Cafe", 40)];
         let fresh = vec![ap("Home", 80), ap("Work", 50)];
@@ -480,7 +638,8 @@ mod tests {
         let out = merge_ap_sets(&current, &fresh, None, &mut misses, &known);
 
         assert_eq!(ssids(&out), vec!["Home", "Work", "Cafe"]);
-        assert_eq!(out[0].strength, 80);
+        let home = out.iter().find(|a| a.ssid == "Home").expect("Home kept");
+        assert_eq!(home.strength, 80);
     }
 
     #[test]

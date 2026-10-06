@@ -84,7 +84,9 @@ pub fn parse_wifi_qr(text: &str) -> Option<WifiQr> {
         if field.is_empty() {
             continue;
         }
-        let (k, v) = split_kv(&field)?;
+        let Some((k, v)) = split_kv(&field) else {
+            continue;
+        };
         match k.to_ascii_uppercase().as_str() {
             "S" => ssid = Some(v),
             "P" => password = Some(v),
@@ -155,20 +157,23 @@ pub fn route(qr: &WifiQr) -> Option<BackendCmd> {
         } else {
             BackendCmd::ConnectOpen(qr.ssid.clone())
         }),
-        WifiSecurity::Wpa => {
-            let psk = qr.password.clone().filter(|p| !p.is_empty())?;
-            Some(if qr.hidden {
-                BackendCmd::ConnectHidden {
-                    ssid: qr.ssid.clone(),
-                    psk,
-                }
-            } else {
-                BackendCmd::ConnectSecure {
-                    ssid: qr.ssid.clone(),
-                    psk,
-                }
-            })
-        }
+        WifiSecurity::Wpa => Some(if qr.hidden {
+            BackendCmd::ConnectHidden {
+                ssid: qr.ssid.clone(),
+                psk: qr
+                    .password
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_default(),
+            }
+        } else if let Some(psk) = qr.password.clone().filter(|p| !p.is_empty()) {
+            BackendCmd::ConnectSecure {
+                ssid: qr.ssid.clone(),
+                psk,
+            }
+        } else {
+            BackendCmd::ExpandRow(qr.ssid.clone())
+        }),
         WifiSecurity::Wep | WifiSecurity::Unknown(_) => None,
     }
 }
@@ -222,5 +227,24 @@ mod tests {
             ..open.clone()
         };
         assert!(route(&wep).is_none());
+    }
+
+    #[test]
+    fn route_expands_when_the_password_is_missing() {
+        let bare = WifiQr {
+            ssid: "C".into(),
+            password: None,
+            hidden: false,
+            security: WifiSecurity::Wpa,
+        };
+        assert!(matches!(route(&bare), Some(BackendCmd::ExpandRow(_))));
+        let bare_hidden = WifiQr {
+            hidden: true,
+            ..bare.clone()
+        };
+        assert!(matches!(
+            route(&bare_hidden),
+            Some(BackendCmd::ConnectHidden { .. })
+        ));
     }
 }

@@ -14,7 +14,8 @@ const MAX_PROVIDED_PER_PATH: usize = 4;
 const MAX_WAITERS: usize = 16;
 struct Waiter {
     path: String,
-    tx: oneshot::Sender<String>,
+
+    tx: oneshot::Sender<Option<String>>,
 }
 #[derive(Default)]
 struct Inner {
@@ -29,12 +30,19 @@ impl SecretStore {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
-    pub async fn provide(&self, path: &str, psk: String) {
+    pub async fn provide(&self, path: &str, psk: String) -> bool {
         let mut g = self.inner.lock().await;
-        if let Some(i) = g.waiters.iter().position(|w| w.path == path) {
-            let w = g.waiters.remove(i);
-            let _ = w.tx.send(psk);
-            return;
+        if g.waiters.iter().any(|w| w.path == path) {
+            let mut i = 0;
+            while i < g.waiters.len() {
+                if g.waiters[i].path == path {
+                    let w = g.waiters.remove(i);
+                    let _ = w.tx.send(Some(psk.clone()));
+                } else {
+                    i += 1;
+                }
+            }
+            return true;
         }
         if g.provided.len() >= MAX_PROVIDED_PATHS
             && !g.provided.contains_key(path)
@@ -47,7 +55,9 @@ impl SecretStore {
             slot.remove(0);
         }
         slot.push(psk);
+        false
     }
+
     pub async fn try_take(&self, path: &str) -> Option<String> {
         let mut g = self.inner.lock().await;
         let v = g.provided.get_mut(path)?;
@@ -57,6 +67,7 @@ impl SecretStore {
         }
         Some(psk)
     }
+
     pub async fn wait(&self, path: &str) -> Option<String> {
         let rx = {
             let mut g = self.inner.lock().await;
@@ -79,11 +90,25 @@ impl SecretStore {
             });
             rx
         };
-        rx.await.ok()
+        rx.await.ok().flatten()
     }
+    pub async fn forget_path(&self, path: &str) {
+        let mut g = self.inner.lock().await;
+        g.provided.remove(path);
+        g.waiters.retain(|w| w.path != path);
+    }
+
     pub async fn cancel_path(&self, path: &str) {
         let mut g = self.inner.lock().await;
-        g.waiters.retain(|w| w.path != path);
+        let mut i = 0;
+        while i < g.waiters.len() {
+            if g.waiters[i].path == path {
+                let w = g.waiters.remove(i);
+                let _ = w.tx.send(None);
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 pub fn extract_ssid(connection: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<String> {
@@ -98,6 +123,38 @@ pub fn extract_ssid(connection: &HashMap<String, HashMap<String, OwnedValue>>) -
     };
     crate::nm_client::aps::decode_ssid(&bytes)
 }
+const NO_SECRETS_AVAILABLE: &str =
+    "org.freedesktop.NetworkManager.SecretAgent.Error.NoSecretsAvailable";
+
+fn defer_to_other_agents(reason: &str) -> fdo::Error {
+    tracing::debug!(reason, "deferring secret to other agents");
+    let named = zbus::names::OwnedErrorName::try_from(NO_SECRETS_AVAILABLE)
+        .ok()
+        .and_then(|name| {
+            zbus::Message::method_call("/", "rnetapplet")
+                .ok()
+                .and_then(|b| b.build(&()).ok())
+                .map(|msg| {
+                    fdo::Error::from(zbus::Error::MethodError(
+                        name,
+                        Some(reason.to_string()),
+                        msg,
+                    ))
+                })
+        });
+    named.unwrap_or_else(|| fdo::Error::Failed(reason.to_string()))
+}
+
+pub fn extract_psk(connection: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<String> {
+    connection
+        .get("802-11-wireless-security")
+        .and_then(|sec| sec.get("psk"))
+        .and_then(|v| match &**v {
+            zbus::zvariant::Value::Str(s) => Some(s.to_string()),
+            _ => None,
+        })
+}
+
 fn secrets_map(psk: &str) -> fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
     let psk = OwnedValue::try_from(zbus::zvariant::Value::new(psk))
         .map_err(|e| fdo::Error::Failed(format!("cannot encode PSK for NM: {e}")))?;
@@ -122,34 +179,47 @@ impl SecretAgentImpl {
         _hints: Vec<String>,
         flags: u32,
     ) -> fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
-        let Some(ssid) = extract_ssid(&connection) else {
-            return Err(fdo::Error::Failed(
-                "no 802-11-wireless.ssid in request".into(),
-            ));
-        };
-        tracing::info!(%ssid, %setting_name, flags, "SecretAgent GetSecrets");
-        if setting_name != "802-11-wireless-security" {
-            return Err(fdo::Error::Failed(format!(
-                "unsupported setting {setting_name}"
-            )));
-        }
         let path = connection_path.to_string();
-        if let Some(psk) = self.store.try_take(&path).await {
+        let request_new = flags & FLAG_REQUEST_NEW != 0;
+        let cached = if request_new {
+            None
+        } else {
+            self.store.try_take(&path).await
+        };
+        if let Some(psk) = cached {
+            let ssid = extract_ssid(&connection).unwrap_or_default();
+            tracing::info!(%ssid, %setting_name, "served stored secret");
             return secrets_map(&psk);
         }
-        let request_new = flags & FLAG_REQUEST_NEW != 0;
-        let _ = self
+        if setting_name != "802-11-wireless-security" {
+            return Err(defer_to_other_agents("not a Wi-Fi security setting"));
+        }
+        let Some(ssid) = extract_ssid(&connection) else {
+            return Err(defer_to_other_agents("no 802-11-wireless.ssid in request"));
+        };
+        tracing::info!(%ssid, %setting_name, flags, "SecretAgent GetSecrets");
+        if !request_new {
+            return Err(defer_to_other_agents("secret not held by this agent"));
+        }
+        if self
             .events
-            .send(UiEvent::SecretsNeeded {
+            .try_send(UiEvent::SecretsNeeded {
                 ssid: ssid.clone(),
                 path: path.clone(),
                 request_new,
             })
-            .await;
+            .is_err()
+        {
+            tracing::warn!(%ssid, "UI channel busy; cancelling secret request");
+            return Err(fdo::Error::Failed("UI channel busy".into()));
+        }
         match tokio::time::timeout(SECRET_TIMEOUT, self.store.wait(&path)).await {
             Ok(Some(psk)) => secrets_map(&psk),
             Ok(None) => Err(fdo::Error::Failed("secret request cancelled".into())),
-            Err(_) => Err(fdo::Error::Failed("timed out waiting for password".into())),
+            Err(_) => {
+                self.store.cancel_path(&path).await;
+                Err(fdo::Error::Failed("timed out waiting for password".into()))
+            }
         }
     }
     async fn cancel_get_secrets(
@@ -163,10 +233,15 @@ impl SecretAgentImpl {
     }
     async fn save_secrets(
         &self,
-        _connection: HashMap<String, HashMap<String, OwnedValue>>,
+        connection: HashMap<String, HashMap<String, OwnedValue>>,
         connection_path: zbus::zvariant::OwnedObjectPath,
     ) -> fdo::Result<()> {
-        tracing::debug!(%connection_path, "SecretAgent SaveSecrets (noop)");
+        let Some(psk) = extract_psk(&connection) else {
+            tracing::debug!(%connection_path, "SaveSecrets without a psk");
+            return Ok(());
+        };
+        self.store.provide(&connection_path.to_string(), psk).await;
+        tracing::debug!(%connection_path, "SaveSecrets kept for this session");
         Ok(())
     }
     async fn delete_secrets(
@@ -174,7 +249,9 @@ impl SecretAgentImpl {
         _connection: HashMap<String, HashMap<String, OwnedValue>>,
         connection_path: zbus::zvariant::OwnedObjectPath,
     ) -> fdo::Result<()> {
-        tracing::debug!(%connection_path, "SecretAgent DeleteSecrets (noop)");
+        let path = connection_path.to_string();
+        self.store.forget_path(&path).await;
+        tracing::debug!(%connection_path, "DeleteSecrets dropped cached secret");
         Ok(())
     }
 }
@@ -209,6 +286,38 @@ mod tests {
         assert_eq!(extract_ssid(&ssid_map(b"Home")), Some("Home".into()));
         assert_eq!(extract_ssid(&HashMap::new()), None);
     }
+    fn psk_map(psk: &str) -> HashMap<String, HashMap<String, OwnedValue>> {
+        let v = OwnedValue::try_from(zbus::zvariant::Value::new(psk.to_string())).unwrap();
+        HashMap::from([(
+            "802-11-wireless-security".to_string(),
+            HashMap::from([("psk".to_string(), v)]),
+        )])
+    }
+
+    #[test]
+    fn extracts_psk_string() {
+        assert_eq!(extract_psk(&psk_map("hunter2")).as_deref(), Some("hunter2"));
+        assert_eq!(extract_psk(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn deferral_carries_nm_error_name() {
+        let err = defer_to_other_agents("not ours");
+        let name = match &err {
+            fdo::Error::ZBus(zbus::Error::MethodError(name, _, _)) => name.to_string(),
+            _ => panic!("expected a named method error, got {err:?}"),
+        };
+        assert_eq!(name, NO_SECRETS_AVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn forget_path_drops_secret_and_waiters() {
+        let s = SecretStore::new();
+        s.provide("/c/1", "pw1".into()).await;
+        s.forget_path("/c/1").await;
+        assert_eq!(s.try_take("/c/1").await, None);
+    }
+
     #[test]
     fn secrets_map_shape() {
         let m = secrets_map("hunter2").expect("test map");

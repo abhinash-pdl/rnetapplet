@@ -66,7 +66,7 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
 
         let pass_entry = gtk4::PasswordEntry::new();
         pass_entry.set_width_chars(12);
-        pass_entry.set_show_peek_icon(true);
+        pass_entry.set_show_peek_icon(false);
         pass_entry.set_placeholder_text(Some("Password"));
         pass_entry.set_text(&h.hotspot_psk.borrow().clone());
         UiHandles::track_entry(&h.hotspot_entries, &pass_entry.clone().upcast());
@@ -132,7 +132,7 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
             let h = h.clone();
             let ssid_w = ssid_entry.downgrade();
             let pass_w = pass_entry.downgrade();
-            start.connect_clicked(move |_| {
+            start.connect_clicked(move |btn| {
                 let Some(ssid_entry) = ssid_w.upgrade() else {
                     return;
                 };
@@ -155,6 +155,7 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                 h.hotspot_expanded.set(false);
                 *h.hotspot_ssid.borrow_mut() = ssid.clone();
                 *h.hotspot_psk.borrow_mut() = psk.clone();
+                btn.grab_focus();
                 let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot { ssid, psk });
             });
         }

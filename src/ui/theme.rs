@@ -7,14 +7,35 @@ use gtk4::prelude::*;
 
 pub(crate) type StrengthSetter = Rc<dyn Fn(u8)>;
 
+const STEPS: usize = 5;
+
 thread_local! {
     static THEMED_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    static LOOKUP_CACHE: RefCell<HashMap<(String, i32), bool>> = RefCell::new(HashMap::new());
+    static LOOKUP_CACHE: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+
+    static SIGNAL_NAMES: RefCell<[Option<String>; STEPS]> = RefCell::new(Default::default());
+    static PAPIRUS: Cell<Option<bool>> = const { Cell::new(None) };
+    static ADWAITA: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 pub(crate) fn clear_caches() {
     THEMED_CACHE.with(|c| c.borrow_mut().clear());
     LOOKUP_CACHE.with(|c| c.borrow_mut().clear());
+    SIGNAL_NAMES.with(|c| *c.borrow_mut() = Default::default());
+    PAPIRUS.set(None);
+    ADWAITA.set(None);
+}
+
+fn theme_named(needle: &str, slot: &'static std::thread::LocalKey<Cell<Option<bool>>>) -> bool {
+    if let Some(v) = slot.with(|c| c.get()) {
+        return v;
+    }
+    let v = gtk4::Settings::default()
+        .and_then(|s| s.gtk_icon_theme_name())
+        .map(|n| n.as_str().to_lowercase().contains(needle))
+        .unwrap_or(false);
+    slot.with(|c| c.set(Some(v)));
+    v
 }
 
 pub(crate) fn signal_step(strength: u8) -> &'static str {
@@ -37,15 +58,14 @@ pub(crate) fn bar_count(strength: u8) -> usize {
     }
 }
 
-pub(crate) fn lookup_ok(name: &str, size: i32) -> bool {
-    let key = (name.to_string(), size);
-    if let Some(v) = LOOKUP_CACHE.with(|c| c.borrow().get(&key).copied()) {
+fn lookup_ok(name: &str) -> bool {
+    if let Some(v) = LOOKUP_CACHE.with(|c| c.borrow().get(name).copied()) {
         return v;
     }
     let has = gtk4::gdk::Display::default()
         .map(|d| gtk4::IconTheme::for_display(&d).has_icon(name))
         .unwrap_or(false);
-    LOOKUP_CACHE.with(|c| c.borrow_mut().insert(key, has));
+    LOOKUP_CACHE.with(|c| c.borrow_mut().insert(name.to_string(), has));
     has
 }
 
@@ -198,31 +218,44 @@ fn centered_image(name: &str) -> gtk4::Image {
 }
 
 pub(crate) fn header_icon_px() -> i32 {
-    let adwaita = gtk4::Settings::default()
-        .and_then(|s| s.gtk_icon_theme_name())
-        .map(|n| n.as_str().to_lowercase().contains("adwaita"))
-        .unwrap_or(false);
-    if adwaita { 20 } else { 24 }
+    if theme_named("adwaita", &ADWAITA) {
+        20
+    } else {
+        24
+    }
 }
 
 fn papirus_theme() -> bool {
-    gtk4::Settings::default()
-        .and_then(|s| s.gtk_icon_theme_name())
-        .map(|n| n.as_str().to_lowercase().contains("papirus"))
-        .unwrap_or(false)
+    theme_named("papirus", &PAPIRUS)
+}
+
+fn step_index(strength: u8) -> usize {
+    match strength {
+        0..=5 => 0,
+        6..=30 => 1,
+        31..=55 => 2,
+        56..=80 => 3,
+        _ => 4,
+    }
 }
 
 fn themed_signal_name(strength: u8) -> String {
+    let i = step_index(strength);
+    if let Some(v) = SIGNAL_NAMES.with(|c| c.borrow()[i].clone()) {
+        return v;
+    }
     let step = signal_step(strength);
     let sym = format!("network-wireless-signal-{step}-symbolic");
     let plain = format!("network-wireless-signal-{step}");
-    if lookup_ok(&sym, 24) {
-        sym
-    } else if lookup_ok(&plain, 24) {
-        plain
+    let found = if lookup_ok(&sym) {
+        Some(sym)
+    } else if lookup_ok(&plain) {
+        Some(plain)
     } else {
-        String::new()
-    }
+        None
+    };
+    SIGNAL_NAMES.with(|c| c.borrow_mut()[i] = found.clone());
+    found.unwrap_or_default()
 }
 
 pub(crate) fn net_icon_live(strength: u8, secured: bool) -> (gtk4::Widget, StrengthSetter) {

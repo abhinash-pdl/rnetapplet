@@ -3,21 +3,36 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ap {
     pub ssid: String,
+    pub bands: u8,
     pub strength: u8,
     pub secured: bool,
+    pub enterprise: bool,
+    pub wep: bool,
+    pub freq_mhz: Option<u32>,
     pub saved: bool,
+
+    pub known: bool,
     pub priority: i32,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VpnConnection {
     pub id: String,
     pub active: bool,
+
+    pub path: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotspotInfo {
     pub ssid: String,
     pub psk: Option<String>,
     pub active: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WiredInfo {
+    pub id: String,
+    pub iface: String,
+    pub ipv4: Option<String>,
+    pub speed_mbps: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Model {
@@ -26,6 +41,11 @@ pub struct Model {
     pub active_iface: Option<String>,
     pub active_ipv4: Option<String>,
     pub active_bitrate_kbps: Option<u32>,
+    pub active_gateway: Option<String>,
+    pub active_dns: Vec<String>,
+    pub active_freq_mhz: Option<u32>,
+    pub saved_ssids: Arc<[String]>,
+    pub wired: Option<WiredInfo>,
     pub hotspot: Option<HotspotInfo>,
     pub wifi_enabled: bool,
     pub networking_enabled: bool,
@@ -73,8 +93,15 @@ pub enum BackendCmd {
     },
     #[allow(dead_code)]
     ProvideSecret {
+        ssid: String,
         path: String,
         psk: String,
+    },
+
+    RetrySaved {
+        ssid: String,
+        psk: String,
+        stale_path: Option<String>,
     },
     SetAirplane(bool),
     CreateHotspot {
@@ -87,6 +114,7 @@ pub enum BackendCmd {
         ssid: String,
         psk: String,
     },
+    ExpandRow(String),
     SetWifi(bool),
     RefreshTray,
     DisconnectActive,
@@ -98,6 +126,7 @@ pub enum BackendCmd {
 pub enum UiEvent {
     Model(Arc<Model>),
     BackendError(String),
+    ExpandRow(String),
     SsidError {
         ssid: String,
         message: String,
@@ -112,6 +141,17 @@ pub enum UiEvent {
         down_bps: Option<u64>,
     },
 }
+
+pub fn sort_aps(aps: &mut [Ap]) {
+    aps.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.strength.cmp(&a.strength))
+            .then_with(|| b.saved.cmp(&a.saved))
+            .then_with(|| a.ssid.cmp(&b.ssid))
+    });
+}
+
 pub fn format_rate(bps: Option<u64>) -> String {
     match bps {
         None => String::from("…"),
@@ -126,10 +166,15 @@ mod tests {
     fn ap(ssid: &str, strength: u8) -> Ap {
         Ap {
             priority: 0,
+            bands: 0,
             ssid: ssid.into(),
             strength,
             secured: true,
+            enterprise: false,
+            wep: false,
+            freq_mhz: None,
             saved: false,
+            known: false,
         }
     }
     #[test]
@@ -147,6 +192,35 @@ mod tests {
         };
         let c = m.clone();
         assert!(Arc::ptr_eq(&m.aps, &c.aps));
+    }
+    #[test]
+    fn rows_are_ordered_by_band_then_signal_then_saved_then_name() {
+        let mut aps = vec![
+            Ap {
+                priority: 1,
+                ..ap("OtherBand", 20)
+            },
+            Ap {
+                priority: 0,
+                saved: true,
+                ..ap("Saved", 30)
+            },
+            Ap {
+                priority: 0,
+                ..ap("Loud", 90)
+            },
+            Ap {
+                priority: 0,
+                ..ap("Middling", 55)
+            },
+        ];
+        sort_aps(&mut aps);
+        let names: Vec<&str> = aps.iter().map(|a| a.ssid.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["OtherBand", "Loud", "Middling", "Saved"],
+            "band comes first, then signal, and saved only breaks a tie"
+        );
     }
     #[test]
     fn active_strength_lookup() {

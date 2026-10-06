@@ -10,16 +10,24 @@ use super::theme::StrengthSetter;
 use crate::state::{BackendCmd, Model};
 use crate::ui::list::refresh_list;
 
+pub type ActionBtn = (gtk4::Button, gtk4::Box, gtk4::Box);
+
 #[derive(Clone)]
 pub(crate) struct UiHandles {
+    pub fit: Rc<dyn Fn()>,
+
+    pub grow: Rc<dyn Fn(i32)>,
+
+    pub anim_until: Rc<Cell<i64>>,
+
+    pub extra_heights: Rc<RefCell<HashMap<String, i32>>>,
+    pub scroll: gtk4::ScrolledWindow,
     pub list: gtk4::ListBox,
     pub root: gtk4::Window,
-    pub scroll: gtk4::ScrolledWindow,
     pub model: Rc<RefCell<Arc<Model>>>,
     pub query: Rc<RefCell<String>>,
     pub expanded: Rc<RefCell<Option<String>>>,
     pub errors: Rc<RefCell<HashMap<String, String>>>,
-    pub err_token: Rc<RefCell<HashMap<String, Instant>>>,
     pub focus_ssid: Rc<RefCell<Option<String>>>,
     pub pw_drafts: Rc<RefCell<HashMap<String, String>>>,
     pub connecting: Rc<RefCell<HashMap<String, Instant>>>,
@@ -39,9 +47,12 @@ pub(crate) struct UiHandles {
     pub speed_labels: Rc<RefCell<Option<(gtk4::Label, gtk4::Label)>>>,
     pub revealers: Rc<RefCell<HashMap<String, gtk4::Revealer>>>,
     pub chevrons: Rc<RefCell<HashMap<String, gtk4::Image>>>,
-    pub connect_btns: Rc<RefCell<HashMap<String, gtk4::Button>>>,
-    pub submits: Rc<RefCell<HashMap<String, gtk4::Button>>>,
-    pub flips: Rc<RefCell<HashMap<String, std::rc::Rc<crate::ui::motion::Flip>>>>,
+
+    pub rows: Rc<RefCell<HashMap<String, gtk4::ListBoxRow>>>,
+    pub action_btns: Rc<RefCell<HashMap<String, ActionBtn>>>,
+    pub card_actions: Rc<RefCell<HashMap<String, gtk4::Box>>>,
+    pub status: Rc<RefCell<HashMap<String, gtk4::Box>>>,
+    pub error_labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
     pub ssid_labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
     pub pw_entries: Rc<RefCell<HashMap<String, gtk4::PasswordEntry>>>,
     pub strength_setters: Rc<RefCell<HashMap<String, StrengthSetter>>>,
@@ -55,6 +66,8 @@ pub(crate) struct UiHandles {
     pub scan_frozen: Arc<AtomicBool>,
     pub pending_model: Rc<RefCell<Option<Arc<crate::state::Model>>>>,
     pub pending_rebuild: Rc<Cell<bool>>,
+
+    pub rebuild_queued: Rc<Cell<bool>>,
     pub last_strengths: Rc<RefCell<HashMap<String, u8>>>,
     pub ap_misses: Rc<RefCell<HashMap<String, u8>>>,
     pub cmd_tx: async_channel::Sender<BackendCmd>,
@@ -232,7 +245,6 @@ impl UiHandles {
             .collect();
         self.pw_drafts.borrow_mut().retain(|k, _| live.contains(k));
         self.connecting.borrow_mut().retain(|k, _| live.contains(k));
-        self.err_token.borrow_mut().retain(|k, _| live.contains(k));
         self.pending_secret_paths
             .borrow_mut()
             .retain(|k, _| live.contains(k));
@@ -249,13 +261,22 @@ pub(crate) fn shell_equivalent(a: &Model, b: &Model) -> bool {
         && a.nm_online == b.nm_online
         && a.wifi_enabled == b.wifi_enabled
         && a.networking_enabled == b.networking_enabled
+        && a.wired == b.wired
+        && a.saved_ssids == b.saved_ssids
         && UiHandles::hotspot_active(a) == UiHandles::hotspot_active(b)
         && a.hotspot.as_ref().map(|h| (&h.ssid, &h.psk))
             == b.hotspot.as_ref().map(|h| (&h.ssid, &h.psk))
 }
 
-pub(crate) fn ap_layout_key(ap: &crate::state::Ap) -> (&str, bool, bool, i32) {
-    (ap.ssid.as_str(), ap.secured, ap.saved, ap.priority)
+pub(crate) fn ap_layout_key(ap: &crate::state::Ap) -> (&str, bool, bool, bool, bool, i32) {
+    (
+        ap.ssid.as_str(),
+        ap.secured,
+        ap.enterprise,
+        ap.wep,
+        ap.saved,
+        ap.priority,
+    )
 }
 
 pub(crate) fn list_equivalent(a: &Model, b: &Model) -> bool {
@@ -265,10 +286,18 @@ pub(crate) fn list_equivalent(a: &Model, b: &Model) -> bool {
     if a.aps.len() != b.aps.len() {
         return false;
     }
-    a.aps
-        .iter()
-        .zip(b.aps.iter())
-        .all(|(x, y)| ap_layout_key(x) == ap_layout_key(y))
+
+    fn key_of(m: &Model) -> HashMap<&str, (&str, bool, bool, bool, bool, i32)> {
+        m.aps
+            .iter()
+            .map(|ap| (ap.ssid.as_str(), ap_layout_key(ap)))
+            .collect()
+    }
+    let (left, right) = (key_of(a), key_of(b));
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|(ssid, key)| right.get(ssid).is_some_and(|other| *other == *key))
 }
 
 pub(crate) fn structural_change(old: &Model, new: &Model) -> bool {
@@ -285,7 +314,12 @@ mod tests {
             ssid: ssid.into(),
             strength,
             secured: true,
+            enterprise: false,
+            wep: false,
+            freq_mhz: None,
+            bands: 0,
             saved: false,
+            known: false,
             priority: 0,
         }
     }
@@ -305,10 +339,10 @@ mod tests {
     }
 
     #[test]
-    fn reordered_aps_is_structural() {
+    fn reordering_aps_is_not_structural() {
         let a = model(vec![ap("A", 30), ap("B", 70)]);
         let b = model(vec![ap("B", 70), ap("A", 30)]);
-        assert!(structural_change(&a, &b));
+        assert!(!structural_change(&a, &b));
     }
 
     #[test]
@@ -329,10 +363,16 @@ mod tests {
     fn becoming_secured_is_structural() {
         let a = model(vec![Ap {
             secured: false,
+            enterprise: false,
+            wep: false,
+            freq_mhz: None,
             ..ap("A", 30)
         }]);
         let b = model(vec![Ap {
             secured: true,
+            enterprise: false,
+            wep: false,
+            freq_mhz: None,
             ..ap("A", 30)
         }]);
         assert!(structural_change(&a, &b));

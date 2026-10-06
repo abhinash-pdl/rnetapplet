@@ -1,4 +1,4 @@
-use super::{get_settings, map_bounded, prop_str};
+use super::{get_settings, map_bounded};
 use anyhow::Result;
 use std::collections::HashMap;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -10,17 +10,9 @@ pub async fn wireless_profile_paths(conn: &zbus::Connection) -> Vec<OwnedObjectP
     let Ok(paths) = settings.list_connections().await else {
         return Vec::new();
     };
-    let typed = map_bounded(paths, |path| {
-        let conn = conn.clone();
-        async move {
-            let ty = prop_str(&conn, &path, "Type").await;
-            (path, ty)
-        }
-    })
-    .await;
-    typed
+    load_wireless_settings(conn, paths)
+        .await
         .into_iter()
-        .filter(|(_, t)| t.as_deref() == Some("802-11-wireless"))
         .map(|(p, _)| p)
         .collect()
 }
@@ -70,59 +62,6 @@ pub fn autoconnect_priority(map: &SettingsMap) -> i32 {
         })
         .unwrap_or(0)
 }
-pub fn ever_connected(map: &SettingsMap) -> bool {
-    map.get("connection")
-        .and_then(|c| c.get("timestamp"))
-        .map(|v| match &**v {
-            Value::U64(t) => *t > 0,
-            Value::I64(t) => *t > 0,
-            _ => false,
-        })
-        .unwrap_or(false)
-}
-pub async fn vpn_profile_path(
-    conn: &zbus::Connection,
-    id: &str,
-) -> Result<Option<OwnedObjectPath>> {
-    let Ok(settings) = rusty_network_manager::SettingsProxy::new(conn).await else {
-        return Ok(None);
-    };
-    let Ok(paths) = settings.list_connections().await else {
-        return Ok(None);
-    };
-    let typed = super::map_bounded(paths, |path| {
-        let conn = conn.clone();
-        async move {
-            let ty = super::prop_str(&conn, &path, "Type").await;
-            (path, ty)
-        }
-    })
-    .await;
-    let wanted: Vec<OwnedObjectPath> = typed
-        .into_iter()
-        .filter(|(_, t)| t.as_deref() == Some("vpn"))
-        .map(|(p, _)| p)
-        .collect();
-    let details = super::map_bounded(wanted, |path| {
-        let conn = conn.clone();
-        async move { super::get_settings(&conn, &path).await.map(|m| (path, m)) }
-    })
-    .await;
-    Ok(details
-        .into_iter()
-        .flatten()
-        .find(|(_, m)| connection_id(m).as_deref() == Some(id))
-        .map(|(p, _)| p))
-}
-
-pub fn connection_id(map: &SettingsMap) -> Option<String> {
-    map.get("connection")
-        .and_then(|c| c.get("id"))
-        .and_then(|v| match &**v {
-            Value::Str(s) => Some(s.to_string()),
-            _ => None,
-        })
-}
 pub async fn saved_profile_path(
     conn: &zbus::Connection,
     ssid: &str,
@@ -130,7 +69,7 @@ pub async fn saved_profile_path(
     let loaded = load_wireless_settings(conn, wireless_profile_paths(conn).await).await;
     Ok(loaded
         .into_iter()
-        .find(|(_, m)| wireless_ssid(m).as_deref() == Some(ssid))
+        .find(|(_, m)| !is_hotspot_profile(m) && wireless_ssid(m).as_deref() == Some(ssid))
         .map(|(p, _)| p))
 }
 pub async fn hotspot_profile_path(conn: &zbus::Connection) -> Result<Option<OwnedObjectPath>> {
@@ -178,7 +117,6 @@ mod tests {
         let m = map();
         assert_eq!(wireless_ssid(&m).as_deref(), Some("Home"));
         assert!(!is_hotspot_profile(&m));
-        assert!(ever_connected(&m));
     }
     #[test]
     fn detects_hotspot_profile() {
@@ -187,14 +125,6 @@ mod tests {
             .unwrap()
             .insert("mode".to_string(), v("ap"));
         assert!(is_hotspot_profile(&m));
-    }
-    #[test]
-    fn never_connected_is_false() {
-        let mut m = map();
-        m.get_mut("connection")
-            .unwrap()
-            .insert("timestamp".to_string(), v(0u64));
-        assert!(!ever_connected(&m));
     }
     #[test]
     fn reads_autoconnect_priority() {
@@ -223,7 +153,6 @@ mod tests {
         assert_eq!(wireless_ssid(&empty), None);
         assert!(!is_hotspot_profile(&empty));
         assert_eq!(profile_psk(&empty), None);
-        assert!(!ever_connected(&empty));
         assert_eq!(autoconnect_priority(&empty), 0);
     }
 }

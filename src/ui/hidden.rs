@@ -3,7 +3,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 
 use super::list::{refresh_list, request_rebuild};
-use super::row::{mark_connecting, section_label};
+use super::row::{action_button_with, mark_connecting, section_label};
 use super::state::UiHandles;
 use crate::state::BackendCmd;
 
@@ -38,8 +38,8 @@ pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
 
     let pass_entry = gtk4::PasswordEntry::new();
     pass_entry.set_width_chars(12);
-    pass_entry.set_show_peek_icon(true);
-    pass_entry.set_placeholder_text(Some("Password (optional)"));
+    pass_entry.set_show_peek_icon(false);
+    pass_entry.set_placeholder_text(Some("Password"));
     UiHandles::track_entry(&h.hidden_entries, &pass_entry.clone().upcast());
     let motion_pass = gtk4::EventControllerMotion::new();
     motion_pass.connect_enter({
@@ -55,18 +55,6 @@ pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
 
     let btn_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     btn_row.set_halign(gtk4::Align::End);
-    let cancel = gtk4::Button::with_label("Cancel");
-    cancel.add_css_class("flat");
-    let connect = gtk4::Button::with_label("Connect");
-    connect.add_css_class("suggested-action");
-    btn_row.append(&cancel);
-    btn_row.append(&connect);
-    vbox.append(&btn_row);
-
-    {
-        let h = h.clone();
-        cancel.connect_clicked(move |_| collapse_hidden(&h));
-    }
     let submit = Rc::new({
         let h = h.clone();
         let ssid_w = ssid_entry.downgrade();
@@ -96,10 +84,19 @@ pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
             let _ = h.cmd_tx.try_send(BackendCmd::ConnectHidden { ssid, psk });
         }
     });
-    {
+
+    let cancel = action_button_with("Cancel", false, {
+        let h = h.clone();
+        move || collapse_hidden(&h)
+    });
+    let connect = action_button_with("Connect", false, {
         let submit = submit.clone();
-        connect.connect_clicked(move |_| submit());
-    }
+        move || submit()
+    });
+    btn_row.append(&cancel);
+    btn_row.append(&connect);
+    vbox.append(&btn_row);
+
     {
         let submit = submit.clone();
         pass_entry.connect_activate(move |_| submit());
@@ -120,7 +117,7 @@ pub(crate) fn ensure_hidden_card(h: &UiHandles) -> (gtk4::Revealer, gtk4::ListBo
     holder.append(&hidden_form_row(h));
     let rev = gtk4::Revealer::new();
     rev.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    rev.set_transition_duration(160);
+    rev.set_transition_duration(crate::ui::motion::REVEAL_MS);
     rev.set_reveal_child(false);
     rev.set_child(Some(&holder));
     let wrap = gtk4::ListBoxRow::new();

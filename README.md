@@ -11,16 +11,19 @@ connections; everything happens inside the popup.
 
 ## Features
 
-- Nearby networks listed live, sorted by signal strength
-- One-click connect to saved or open networks
+- Nearby networks listed live with signal bands (2.4G/5G/6G), sorted by signal strength
+- One-click connect to saved or open networks; saved networks stay
+  listed with connect/forget even out of range
 - Inline password entry — the applet acts as its own NetworkManager
   SecretAgent, so a wrong password can be retried without a dialog
 - Malformed passwords are rejected before they reach NetworkManager, and
   if a connect attempt fails, the previous network is re-activated
   automatically
-- Wi-Fi and airplane-mode toggles
+- Connected details: IPv4, gateway, DNS, band, MAC, live up/down speeds
+- Wi-Fi and airplane-mode toggles, wired connection status
 - Hotspot creation (with name and password)
 - QR-code connect from a webcam or an image file
+- Desktop notifications on connect/disconnect
 - Settings shortcut that opens the system `nm-connection-editor`
 - Tray icon follows the icon theme
 - Saved VPN connections listed with connect/disconnect
@@ -90,10 +93,10 @@ install it:
 
 ```sh
 curl -L -o rnetapplet.tar.gz \
-  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.2/rnetapplet-0.1.2-x86_64-linux.tar.gz
-echo "fc4565ceb3f9d190b14c24dd8df0571be7873cfa43fd5d3e5cfc25523e42128e  rnetapplet.tar.gz" | sha256sum -c -
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.3/rnetapplet-0.1.3-x86_64-linux.tar.gz
+echo "23efc3c3d250a61a4fd38ddbf0dc72a15454fe6d0bb8b3b1599e26a7cae32dfc  rnetapplet.tar.gz" | sha256sum -c -
 tar xzf rnetapplet.tar.gz
-cd rnetapplet-0.1.2-x86_64-linux
+cd rnetapplet-0.1.3-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
@@ -201,6 +204,7 @@ Hyprland: the same command in `exec-once`).
 ## Usage
 
 - Left-click the tray icon to open or close the popup.
+- Click anywhere outside the popup to dismiss it.
 - Right-click the tray icon for the context menu (Open, Wi-Fi, Quit).
 - Click a saved or open network to connect immediately.
 - Click the chevron or the Connect button on a secured network to reveal an

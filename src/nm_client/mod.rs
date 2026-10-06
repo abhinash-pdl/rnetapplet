@@ -2,6 +2,7 @@ pub mod aps;
 pub mod connect;
 pub mod details;
 pub mod hotspot;
+pub mod known;
 pub mod profiles;
 pub mod radio;
 pub mod signals;
@@ -11,7 +12,7 @@ use futures::StreamExt as _;
 use rusty_network_manager::{ActiveProxy, DeviceProxy, NetworkManagerProxy, WirelessProxy};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 pub const NM_DEVICE_TYPE_WIFI: u32 = 2;
@@ -21,9 +22,22 @@ const PROFILE_TTL: Duration = Duration::from_secs(30);
 pub const SCAN_WAIT: Duration = Duration::from_secs(12);
 const STALE_HORIZON: Duration = Duration::from_secs(120);
 
-const STALE_TOLERANCE: u64 = 60;
+pub const DBUS_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+const STALE_TOLERANCE_VISIBLE: u64 = 12;
+
+const STALE_TOLERANCE_HIDDEN: u64 = 86_400;
+
+pub fn boottime_secs() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs = uptime.split_whitespace().next()?;
+    secs.split('.').next()?.parse().ok()
+}
+
+pub fn is_ghost(last_seen: u64, scan_completed: u64, tolerance: u64) -> bool {
+    last_seen > 0 && scan_completed > 0 && last_seen.saturating_add(tolerance) < scan_completed
+}
 const AP_INTERFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
-const CONNECTION_INTERFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
 pub async fn map_bounded<I, T, F, Fut, R>(items: I, f: F) -> Vec<R>
 where
     I: IntoIterator<Item = T>,
@@ -41,12 +55,16 @@ pub struct NmClient {
     system: Connection,
     pub nm: NetworkManagerProxy<'static>,
     profiles: tokio::sync::Mutex<Option<(Instant, Arc<ProfileIndex>)>>,
-    scan_cutoff: AtomicU64,
     scan_completed: AtomicU64,
+    connected_once: tokio::sync::RwLock<std::collections::BTreeSet<String>>,
+    popup_visible: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl NmClient {
     pub async fn connect() -> Result<Self> {
-        let system = Connection::system()
+        let system = zbus::connection::Builder::system()
+            .context("system bus address")?
+            .method_timeout(DBUS_CALL_TIMEOUT)
+            .build()
             .await
             .context("failed to connect to system D-Bus")?;
         let nm = NetworkManagerProxy::new(&system)
@@ -56,12 +74,27 @@ impl NmClient {
             system,
             nm,
             profiles: tokio::sync::Mutex::new(None),
-            scan_cutoff: AtomicU64::new(0),
             scan_completed: AtomicU64::new(0),
+            connected_once: tokio::sync::RwLock::new(known::load()),
+            popup_visible: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
     pub fn system_conn(&self) -> &Connection {
         &self.system
+    }
+    pub fn popup_visible(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.popup_visible.clone()
+    }
+
+    pub async fn has_connected(&self, ssid: &str) -> bool {
+        self.connected_once.read().await.contains(ssid)
+    }
+    pub async fn mark_connected(&self, ssid: &str) {
+        let mut set = self.connected_once.write().await;
+        if set.insert(ssid.to_string()) {
+            known::save(&set);
+            tracing::info!(ssid, "network marked as previously connected");
+        }
     }
     pub async fn version(&self) -> Result<String> {
         Ok(self.nm.version().await?)
@@ -94,13 +127,9 @@ impl NmClient {
         loop {
             let now = wifi.last_scan().await.unwrap_or(0);
             if now > 0 && now != before {
-                let completed_at = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                self.scan_cutoff
-                    .store((now / 1000) as u64, Ordering::Relaxed);
-                self.scan_completed.store(completed_at, Ordering::Relaxed);
+                if let Some(done) = boottime_secs() {
+                    self.scan_completed.store(done, Ordering::Relaxed);
+                }
                 return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -113,7 +142,6 @@ impl NmClient {
         let wifi = WirelessProxy::new_from_path(wifi_path.clone(), self.system_conn()).await?;
         let ap_paths = wifi.get_all_access_points().await.unwrap_or_default();
         if ap_paths.is_empty() {
-            self.scan_cutoff.store(0, Ordering::Relaxed);
             return Ok(Vec::new());
         }
         let n_paths = ap_paths.len();
@@ -122,47 +150,60 @@ impl NmClient {
             async move { ap_props(&conn, &path).await }
         })
         .await;
-        let cutoff = self.scan_cutoff.load(Ordering::Relaxed);
         let completed = self.scan_completed.load(Ordering::Relaxed);
         let fresh = completed > 0
-            && cutoff > 0
-            && SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs().saturating_sub(completed) <= STALE_HORIZON.as_secs())
+            && boottime_secs()
+                .map(|now| now.saturating_sub(completed) <= STALE_HORIZON.as_secs())
                 .unwrap_or(false);
-        tracing::debug!(cutoff, fresh, "stale filter state");
+        tracing::debug!(completed, fresh, "stale filter state");
         let (_vpn_index, saved) = self.profile_index().await;
         let priority_of = |ssid: &str| saved.get(ssid).copied().unwrap_or(0);
         let mut by_ssid: std::collections::HashMap<String, Ap> = std::collections::HashMap::new();
         for props in rows.into_iter().flatten() {
             let Some(ssid) = props.ssid else { continue };
-            if fresh
-                && props.last_seen > 0
-                && props.last_seen.saturating_add(STALE_TOLERANCE) < cutoff
-            {
+            let tolerance = if self.popup_visible.load(Ordering::Relaxed) {
+                STALE_TOLERANCE_VISIBLE
+            } else {
+                STALE_TOLERANCE_HIDDEN
+            };
+            if fresh && is_ghost(props.last_seen, completed, tolerance) {
                 tracing::debug!(
                     ssid = %ssid,
                     last_seen = props.last_seen,
-                    cutoff,
+                    completed,
                     "pruning stale ap"
                 );
                 continue;
             }
             let is_saved = saved.contains_key(&ssid);
             match by_ssid.get_mut(&ssid) {
-                Some(slot) if props.strength > slot.strength => {
-                    slot.strength = props.strength;
+                Some(slot) => {
+                    if props.strength > slot.strength {
+                        slot.strength = props.strength;
+                        slot.freq_mhz = props.freq_mhz;
+                    }
+                    slot.bands |= aps::band_bit(props.freq_mhz);
+                    slot.secured = props.secured;
+                    slot.enterprise = props.enterprise;
+                    slot.wep = props.wep;
+                    slot.saved = is_saved;
+                    slot.known = is_saved && self.has_connected(&ssid).await;
+                    slot.priority = priority_of(&ssid);
                 }
-                Some(_) => {}
                 None => {
                     by_ssid.insert(
                         ssid.clone(),
                         Ap {
                             saved: is_saved,
+                            known: is_saved && self.has_connected(&ssid).await,
                             priority: priority_of(&ssid),
+                            bands: aps::band_bit(props.freq_mhz),
                             ssid,
                             strength: props.strength,
+                            freq_mhz: props.freq_mhz,
                             secured: props.secured,
+                            enterprise: props.enterprise,
+                            wep: props.wep,
                         },
                     );
                 }
@@ -170,13 +211,7 @@ impl NmClient {
         }
         let mut aps: Vec<Ap> = by_ssid.into_values().collect();
         tracing::debug!(paths = n_paths, ssids = aps.len(), "ap list built");
-        aps.sort_by(|a, b| {
-            b.saved
-                .cmp(&a.saved)
-                .then_with(|| b.priority.cmp(&a.priority))
-                .then_with(|| b.strength.cmp(&a.strength))
-                .then_with(|| a.ssid.cmp(&b.ssid))
-        });
+        crate::state::sort_aps(&mut aps);
         Ok(aps)
     }
     pub async fn autoconnect_candidates(&self) -> Vec<(String, i32)> {
@@ -184,6 +219,9 @@ impl NmClient {
         let mut out: Vec<(String, i32)> = saved.into_iter().collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
+    }
+    pub async fn drop_profile_cache(&self) {
+        *self.profiles.lock().await = None;
     }
     pub async fn profile_index(&self) -> ProfileIndex {
         {
@@ -211,20 +249,7 @@ impl NmClient {
         let Ok(paths) = settings.list_connections().await else {
             return (Vec::new(), Default::default());
         };
-        let typed = map_bounded(paths, |path| {
-            let conn = self.system.clone();
-            async move {
-                let ty = prop_str(&conn, &path, "Type").await;
-                (path, ty)
-            }
-        })
-        .await;
-        let wanted: Vec<OwnedObjectPath> = typed
-            .iter()
-            .filter(|(_, t)| t.as_deref() == Some("802-11-wireless") || t.as_deref() == Some("vpn"))
-            .map(|(p, _)| p.clone())
-            .collect();
-        let details = map_bounded(wanted, |path| {
+        let details = map_bounded(paths, |path| {
             let conn = self.system.clone();
             async move {
                 let map = get_settings(&conn, &path).await;
@@ -245,7 +270,7 @@ impl NmClient {
                     _ => None,
                 });
             match kind.as_deref() {
-                Some("vpn") => {
+                Some("vpn") | Some("wireguard") => {
                     let id = map
                         .get("connection")
                         .and_then(|c| c.get("id"))
@@ -258,10 +283,11 @@ impl NmClient {
                     vpns.push(VpnConnection {
                         id,
                         active: is_active,
+                        path: path.to_string(),
                     });
                 }
                 Some("802-11-wireless") => {
-                    if !profiles::ever_connected(&map) {
+                    if profiles::is_hotspot_profile(&map) {
                         continue;
                     }
                     if let Some(ssid) = profiles::wireless_ssid(&map) {
@@ -283,7 +309,7 @@ impl NmClient {
                 let Ok(proxy) = ActiveProxy::new_from_path(path, &conn).await else {
                     return None;
                 };
-                if proxy.type_().await.as_deref() != Ok("vpn") {
+                if !matches!(proxy.type_().await.as_deref(), Ok("vpn") | Ok("wireguard")) {
                     return None;
                 }
                 proxy.id().await.ok()
@@ -328,8 +354,12 @@ impl NmClient {
         }
         let mut active_ssid = self.active_ssid().await.unwrap_or(None);
         let vpn_connections = self.vpn_connections().await.unwrap_or_default();
-        let (active_iface, active_ipv4, active_bitrate_kbps) =
-            details::active_details(self, wifi_path.clone()).await;
+        let (_, saved_profiles) = self.profile_index().await;
+        let mut saved_ssids: Vec<String> = saved_profiles.into_keys().collect();
+        saved_ssids.sort();
+        tracing::debug!(count = saved_ssids.len(), ?saved_ssids, "saved profiles");
+        let net = details::active_details(self, wifi_path.clone()).await;
+        let wired = details::wired_status(self).await;
         let hotspot = details::hotspot_status(self).await.unwrap_or(None);
         if let Some(hs) = hotspot.as_ref().filter(|h| h.active) {
             aps.retain(|ap| ap.ssid != hs.ssid);
@@ -340,9 +370,14 @@ impl NmClient {
         Ok(Model {
             aps: aps.into(),
             active_ssid,
-            active_iface,
-            active_ipv4,
-            active_bitrate_kbps,
+            active_iface: net.iface,
+            active_ipv4: net.ipv4,
+            active_bitrate_kbps: net.bitrate_kbps,
+            active_gateway: net.gateway,
+            active_dns: net.dns,
+            active_freq_mhz: net.freq_mhz,
+            saved_ssids: saved_ssids.clone().into(),
+            wired,
             hotspot,
             wifi_enabled,
             networking_enabled,
@@ -354,7 +389,10 @@ impl NmClient {
 struct ApProps {
     ssid: Option<String>,
     strength: u8,
+    freq_mhz: Option<u32>,
     secured: bool,
+    enterprise: bool,
+    wep: bool,
     last_seen: u64,
 }
 async fn ap_props(conn: &Connection, path: &OwnedObjectPath) -> Option<ApProps> {
@@ -371,6 +409,9 @@ async fn ap_props(conn: &Connection, path: &OwnedObjectPath) -> Option<ApProps> 
     let all = proxy.get_all(iface).await.ok()?;
     let u8_of = |k: &str| -> u8 { all.get(k).and_then(|v| u8::try_from(v).ok()).unwrap_or(0) };
     let u32_of = |k: &str| -> u32 { all.get(k).and_then(|v| u32::try_from(v).ok()).unwrap_or(0) };
+    let flags = u32_of("Flags");
+    let wpa = u32_of("WpaFlags");
+    let rsn = u32_of("RsnFlags");
     let ssid = all
         .get("Ssid")
         .and_then(bytes_to_ssid)
@@ -385,7 +426,13 @@ async fn ap_props(conn: &Connection, path: &OwnedObjectPath) -> Option<ApProps> 
     Some(ApProps {
         ssid,
         strength: u8_of("Strength"),
-        secured: aps::is_secured(u32_of("WpaFlags"), u32_of("RsnFlags")),
+        freq_mhz: {
+            let f = u32_of("Frequency");
+            if f > 0 { Some(f) } else { None }
+        },
+        secured: aps::is_secured(wpa, rsn) || aps::is_wep_only(flags, wpa, rsn),
+        enterprise: aps::is_enterprise(wpa, rsn),
+        wep: aps::is_wep_only(flags, wpa, rsn),
         last_seen,
     })
 }
@@ -395,27 +442,6 @@ pub(crate) fn bytes_to_ssid(v: &OwnedValue) -> Option<String> {
             let bytes: Vec<u8> = arr.iter().filter_map(|b| u8::try_from(b).ok()).collect();
             aps::decode_ssid(&bytes)
         }
-        _ => None,
-    }
-}
-pub(crate) async fn prop_str(
-    conn: &Connection,
-    path: &OwnedObjectPath,
-    name: &str,
-) -> Option<String> {
-    use zbus::fdo::PropertiesProxy;
-    let iface = zbus::names::InterfaceName::try_from(CONNECTION_INTERFACE).ok()?;
-    let proxy = PropertiesProxy::builder(conn)
-        .destination("org.freedesktop.NetworkManager")
-        .ok()?
-        .path(path.clone())
-        .ok()?
-        .build()
-        .await
-        .ok()?;
-    let value: OwnedValue = proxy.get(iface, name).await.ok()?;
-    match value.into() {
-        Value::Str(s) => Some(s.to_string()),
         _ => None,
     }
 }
@@ -494,4 +520,34 @@ pub(crate) async fn active_conn_is_hotspot(conn: &Connection, path: &OwnedObject
         .and_then(|w| w.get("mode"))
         .map(|v| matches!(&**v, Value::Str(s) if s.as_str() == "ap"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod ghost_tests {
+    use super::*;
+
+    #[test]
+    fn ghost_is_dropped_after_tolerance() {
+        assert!(is_ghost(1_000, 1_200, 60));
+        assert!(is_ghost(1_100, 1_200, 60));
+    }
+
+    #[test]
+    fn fresh_ap_is_kept() {
+        assert!(!is_ghost(1_190, 1_200, 60));
+        assert!(!is_ghost(1_200, 1_200, 60));
+    }
+
+    #[test]
+    fn unknown_or_unscanned_is_kept() {
+        assert!(!is_ghost(0, 1_200, 60));
+        assert!(!is_ghost(500, 0, 60));
+    }
+
+    #[test]
+    fn boottime_is_plausible() {
+        let secs = boottime_secs().expect("boottime");
+        assert!(secs > 1_000, "uptime should exceed ~16 minutes");
+        assert!(secs < 100_000_000, "uptime should stay well below epoch");
+    }
 }

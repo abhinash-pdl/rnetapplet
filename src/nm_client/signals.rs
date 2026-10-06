@@ -227,8 +227,10 @@ async fn crawl(client: &NmClient, out: &ModelTx) {
 }
 
 async fn crawl_then_confirm(client: &NmClient, out: &ModelTx) {
+    if !out.borrow().aps.is_empty() {
+        tokio::time::sleep(SETTLE).await;
+    }
     crawl_settled(client, out).await;
-    confirm_membership(client, out).await;
 }
 
 async fn crawl_settled(client: &NmClient, out: &ModelTx) {
@@ -255,33 +257,6 @@ async fn crawl_settled(client: &NmClient, out: &ModelTx) {
     }
 }
 
-fn ssid_set(aps: &[crate::state::Ap]) -> std::collections::HashSet<String> {
-    aps.iter().map(|a| a.ssid.clone()).collect()
-}
-
-async fn confirm_membership(client: &NmClient, out: &ModelTx) {
-    let Ok(Some(path)) = client.wifi_device_path().await else {
-        return;
-    };
-    tokio::time::sleep(SETTLE).await;
-    let Ok(aps) = client.list_aps(&path).await else {
-        return;
-    };
-    if aps.is_empty() || ssid_set(&aps) == ssid_set(&out.borrow().aps) {
-        return;
-    }
-    match client.refresh_model().await {
-        Ok(model) => {
-            if !keep_over(&out.borrow(), &model) {
-                tracing::debug!("dropping empty settle correction over populated list");
-                return;
-            }
-            info!(aps = model.aps.len(), "AP set corrected after settle");
-            let _ = out.send(Arc::new(model));
-        }
-        Err(e) => warn!("settle correction failed: {e:#}"),
-    }
-}
 fn tx_outdated(out: &ModelTx, model: &Model) -> bool {
     out.borrow().aps.len() != model.aps.len()
 }
@@ -307,8 +282,8 @@ pub fn spawn_signal_watcher(
             (
                 "org.freedesktop.DBus.Properties",
                 "PropertiesChanged",
+                Some("/"),
                 None,
-                Some("/org/freedesktop/NetworkManager"),
             ),
             (
                 "org.freedesktop.NetworkManager.Device.Wireless",
@@ -451,7 +426,12 @@ mod tests {
                     ssid: s.to_string(),
                     strength: 70,
                     secured: true,
+                    enterprise: false,
+                    wep: false,
+                    freq_mhz: None,
+                    bands: 0,
                     saved: false,
+                    known: false,
                     priority: 0,
                 })
                 .collect::<Vec<_>>()

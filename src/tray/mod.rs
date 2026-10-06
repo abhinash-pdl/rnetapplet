@@ -90,6 +90,7 @@ impl ksni::Tray for RnetTray {
         }
     }
     fn activate(&mut self, x: i32, y: i32) {
+        tracing::debug!(x, y, "tray icon activated");
         self.emit(BackendCmd::TogglePopup(Some((x, y))));
     }
     fn menu(&self) -> Vec<ksni::menu::MenuItem<Self>> {
@@ -159,6 +160,11 @@ mod tests {
                 ssid: "Home".into(),
                 strength,
                 secured: true,
+                enterprise: false,
+                wep: false,
+                freq_mhz: None,
+                bands: 0,
+                known: false,
                 saved: true,
             }]),
             active_ssid: active.map(str::to_string),

@@ -21,16 +21,36 @@ FLAGS:
     -V, --version         Print version
 OPTIONS:
     --connect-saved <SSID>  Activate a saved profile and exit
+    --psk <SECRET>          With --connect-saved: replace the saved password first (retry path)
     --wifi <on|off>         Set the Wi-Fi radio and exit
 ENV:
     RUST_LOG                Tracing filter (default: info), e.g. RUST_LOG=rnetapplet=debug
 ";
+async fn shutdown_signal() {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("cannot listen for SIGTERM: {e}");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
 fn main() -> Result<()> {
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "error".into()),
+                .unwrap_or_else(|_| "rnetapplet=info".into()),
         )
+        .with_ansi(false)
         .init();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -44,6 +64,7 @@ fn main() -> Result<()> {
     validate_args(&args)?;
     let dump = args.iter().any(|a| a == "--dump-aps");
     let connect_saved = take_value(&args, "--connect-saved");
+    let psk = take_value(&args, "--psk");
     let set_wifi = take_value(&args, "--wifi");
     let camera_test = args.iter().any(|a| a == "--camera-test");
     let hotspot_test = args.iter().any(|a| a == "--hotspot-test");
@@ -64,7 +85,7 @@ fn main() -> Result<()> {
             return rt.block_on(hotspot_test_run());
         }
         if let Some(ssid) = connect_saved {
-            return rt.block_on(connect_saved_test(&ssid));
+            return rt.block_on(connect_saved_test(&ssid, psk.as_deref()));
         }
         if let Some(v) = set_wifi {
             return rt.block_on(wifi_test(&v));
@@ -89,10 +110,10 @@ fn main() -> Result<()> {
         });
         anyhow::Ok((client, initial))
     })?;
-    let (model_feed_tx, model_feed_rx) = async_channel::bounded::<state::UiEvent>(4);
+    let (model_feed_tx, model_feed_rx) = async_channel::bounded::<state::UiEvent>(64);
     let (toggle_tx, toggle_rx) = async_channel::bounded::<Option<(i32, i32)>>(4);
     let (quit_tx, quit_rx) = async_channel::bounded::<()>(2);
-    let popup_visible = Arc::new(AtomicBool::new(false));
+    let popup_visible = client.popup_visible();
     let scan_frozen = Arc::new(AtomicBool::new(false));
     let (tray_ev_tx, tray_ev_rx) = async_channel::bounded::<tray::TrayEvent>(16);
     rt.spawn(backend_main(
@@ -120,15 +141,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 fn validate_args(args: &[String]) -> Result<()> {
-    const FLAGS: [&str; 6] = [
+    const FLAGS: [&str; 7] = [
         "--dump-aps",
         "--connect-saved",
         "--wifi",
+        "--psk",
         "--camera-test",
         "--hotspot-test",
         "--version",
     ];
-    const VALUED: [&str; 2] = ["--connect-saved", "--wifi"];
+    const VALUED: [&str; 3] = ["--connect-saved", "--wifi", "--psk"];
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -147,19 +169,51 @@ fn validate_args(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-async fn connect_saved_test(ssid: &str) -> Result<()> {
+async fn connect_saved_test(ssid: &str, psk: Option<&str>) -> Result<()> {
     let client = nm_client::NmClient::connect().await?;
     info!(version = %client.version().await?, "connected to NetworkManager");
-    client.connect_saved(ssid).await?;
-    for i in 0..4 {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let prev = client
+        .active_wifi_snapshot()
+        .await
+        .map(|(profile, ssid)| nm_client::connect::PrevWifi { profile, ssid });
+    let mut rollback = None;
+    match psk {
+        Some(secret) => {
+            let retry = client.retry_saved_with_psk(ssid, secret).await?;
+            rollback = retry.rollback;
+            println!("supplied password written; waiting for the handshake…");
+        }
+        None => {
+            client.connect_saved(ssid).await?;
+        }
+    }
+    let mut last = None;
+    for i in 1..=10 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let active = client.active_ssid().await.unwrap_or(None);
         println!(
             "t+{}s active={}",
-            (i + 1) * 3,
+            i * 2,
             active.as_deref().unwrap_or("(none)")
         );
+        if active.as_deref() == Some(ssid) {
+            println!("RESULT: connected to {ssid}");
+            return Ok(());
+        }
+        last = active;
     }
+    if let Some((profile, old)) = &rollback {
+        client.update_psk(profile, old).await?;
+        println!("RESULT: failed; the previous saved password was put back");
+    }
+    if let Some(prev) = prev {
+        let _ = client.reactivate_previous(&prev.ssid, &prev.profile).await;
+        println!("RESULT: restored {}", prev.ssid);
+    }
+    println!(
+        "RESULT: failed (active={})",
+        last.as_deref().unwrap_or("(none)")
+    );
     Ok(())
 }
 async fn wifi_test(value: &str) -> Result<()> {
@@ -505,23 +559,31 @@ async fn backend_main(
             }
         }
     });
-    let tray_handle = {
-        let mut wait = std::time::Duration::from_secs(3);
-        loop {
-            match tray::spawn(model.clone(), tray_ev_tx.clone()).await {
-                Ok(h) => {
-                    info!("tray registered as org.kde.StatusNotifierItem (id=rnetapplet)");
-                    break h;
-                }
-                Err(e) => {
-                    tracing::warn!("SNI tray host not available ({e:#}); retrying in {wait:?}");
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    let tray_handle: Arc<tokio::sync::OnceCell<ksni::Handle<tray::RnetTray>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let _tray_task = {
+        let tray_handle = tray_handle.clone();
+        let tray_rx = watch_rx.clone();
+        tokio::spawn(async move {
+            let mut wait = std::time::Duration::from_secs(3);
+            loop {
+                match tray::spawn(model.clone(), tray_ev_tx.clone()).await {
+                    Ok(h) => {
+                        info!("tray registered as org.kde.StatusNotifierItem (id=rnetapplet)");
+                        let updater = tray::spawn_updater(h.clone(), tray_rx.clone());
+                        let _ = tray_handle.set(h);
+                        let _ = updater.await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("SNI tray host not available ({e:#}); retrying in {wait:?}");
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+                    }
                 }
             }
-        }
+        })
     };
-    let _tray_updater = tray::spawn_updater(tray_handle.clone(), watch_rx.clone());
     let feed_task = tokio::spawn({
         let mut rx = watch_rx.clone();
         let model_feed = model_feed.clone();
@@ -539,8 +601,9 @@ async fn backend_main(
             }
         }
     });
-    let guards: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let guards: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let manual_disconnect = Arc::new(std::sync::atomic::AtomicBool::new(false));
     macro_rules! settle {
         () => {
             refresher
@@ -561,16 +624,22 @@ async fn backend_main(
                         profile: p,
                         ssid: s,
                     });
-            let outcome: anyhow::Result<()> = $call.await;
+            manual_disconnect.store(false, Ordering::Relaxed);
+            let outcome: anyhow::Result<Option<zbus::zvariant::OwnedObjectPath>> = $call.await;
             match outcome {
-                Ok(()) => nm_client::connect::spawn_restore_guard(
+                Ok(created) => nm_client::connect::spawn_restore_guard(
                     client.clone(),
                     watch_rx.clone(),
                     model_feed.clone(),
-                    $ssid.clone(),
-                    prev,
-                    std::time::Duration::from_secs(30),
-                    guards.clone(),
+                    nm_client::connect::GuardOpts {
+                        target_ssid: $ssid.clone(),
+                        prev,
+                        window: std::time::Duration::from_secs(30),
+                        registry: guards.clone(),
+                        created,
+                        manual: manual_disconnect.clone(),
+                        rollback_psk: None,
+                    },
                 ),
                 Err(e) => {
                     tracing::warn!("connect {} failed: {e:#}", $ssid);
@@ -586,8 +655,8 @@ async fn backend_main(
     }
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("ctrl-c, shutting down");
+            _ = shutdown_signal() => {
+                info!("shutdown signal received");
                 break;
             }
             ev = tray_ev_rx.recv() => {
@@ -634,6 +703,8 @@ async fn backend_main(
                     }
                     state::BackendCmd::DisconnectActive => {
                         info!("disconnect requested");
+                        manual_disconnect.store(true, Ordering::Relaxed);
+                        guards.lock().await.clear();
                         if let Err(e) = client.disconnect_active().await {
                             tracing::warn!("disconnect failed: {e:#}");
                         }
@@ -657,12 +728,72 @@ async fn backend_main(
                         }
                         settle!();
                     }
-                    state::BackendCmd::ProvideSecret { path, psk } => {
-                        info!(%path, "retry password provided");
+                    state::BackendCmd::ProvideSecret { ssid, path, psk } => {
+                        info!(%ssid, %path, "retry password provided");
                         if let Err(e) = nm_client::connect::validate_psk(&psk) {
                             tracing::warn!("rejected invalid retry password for {path}: {e:#}");
-                        } else {
-                            secrets.provide(&path, psk).await;
+                        } else if !secrets.provide(&path, psk.clone()).await {
+
+                            tracing::info!(%ssid, "no pending secret request; retrying profile");
+                            match client.connect_saved_with_psk(&ssid, &psk).await {
+                                Ok(created) => {
+                                    let client = client.clone();
+                                    let refresher = refresher.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(1200))
+                                            .await;
+                                        let _ = client.refresh_model().await;
+                                        refresher.request(nm_client::signals::Cmd::Scan);
+                                    });
+                                    let _ = created;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%ssid, "saved retry failed: {e:#}");
+                                    let _ = model_feed.clone().try_send(state::UiEvent::SsidError {
+                                        ssid,
+                                        message: "Could not connect to this network".into(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    state::BackendCmd::RetrySaved { ssid, psk, stale_path } => {
+                        info!(%ssid, "retrying saved network with a new password");
+                        if let Some(path) = stale_path {
+
+                            secrets.cancel_path(&path).await;
+                        }
+                        let prev = client
+                            .active_wifi_snapshot()
+                            .await
+                            .map(|(p, s)| nm_client::connect::PrevWifi {
+                                profile: p,
+                                ssid: s,
+                            });
+                        manual_disconnect.store(false, Ordering::Relaxed);
+                        match client.retry_saved_with_psk(&ssid, &psk).await {
+                            Ok(retry) => nm_client::connect::spawn_restore_guard(
+                                client.clone(),
+                                watch_rx.clone(),
+                                model_feed.clone(),
+                                nm_client::connect::GuardOpts {
+                                    target_ssid: ssid.clone(),
+                                    prev,
+                                    window: std::time::Duration::from_secs(30),
+                                    registry: guards.clone(),
+                                    created: retry.created,
+                                    manual: manual_disconnect.clone(),
+                                    rollback_psk: retry.rollback,
+                                },
+                            ),
+                            Err(e) => {
+                                tracing::warn!("saved retry failed: {e:#}");
+                                let _ = client.restore_previous(prev).await;
+                                let _ = model_feed.try_send(state::UiEvent::SsidError {
+                                    ssid,
+                                    message: nm_client::connect::MSG_FAILED.into(),
+                                });
+                            }
                         }
                     }
                     state::BackendCmd::CreateHotspot { ssid, psk } => {
@@ -742,6 +873,10 @@ async fn backend_main(
                         }
                         settle!();
                     }
+                    state::BackendCmd::ExpandRow(ssid) => {
+                        info!(ssid, "expand row requested");
+                        let _ = model_feed.try_send(state::UiEvent::ExpandRow(ssid));
+                    }
                     state::BackendCmd::RefreshTray => {
                         info!("theme change, re-emitting tray icon");
                         refresher.request(nm_client::signals::Cmd::Refresh);
@@ -753,7 +888,9 @@ async fn backend_main(
     }
     feed_task.abort();
     refresher.stop();
-    tray_handle.shutdown().await;
+    if let Some(h) = tray_handle.get() {
+        h.shutdown().await;
+    }
     let _ = quit_tx.try_send(());
 }
 #[cfg(test)]

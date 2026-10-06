@@ -98,13 +98,15 @@ impl NmClient {
             None => root_path(),
         }
     }
-    pub async fn connect_open(&self, ssid: &str) -> Result<()> {
+    pub async fn connect_open(&self, ssid: &str) -> Result<Option<OwnedObjectPath>> {
+        self.disconnect_other_wifi(ssid).await?;
         let wifi = self
             .wifi_device_path()
             .await?
             .context("no Wi-Fi device found")?;
         let ap = self.ap_path_for_ssid(&wifi, ssid).await?;
         let existing = super::saved_profile_path(self.system_conn(), ssid).await?;
+        let mut created = None;
         let active = if let Some(profile) = existing {
             self.nm.activate_connection(&profile, &wifi, &ap).await?
         } else {
@@ -112,40 +114,71 @@ impl NmClient {
             let (conn, active) = self
                 .nm
                 .add_and_activate_connection(profile, &wifi, &ap)
-                .await?;
+                .await
+                .inspect_err(|e| tracing::warn!(ssid, "AddAndActivateConnection failed: {e:#}"))?;
             tracing::info!(ssid, %conn, "AddAndActivateConnection issued (open, new profile)");
+            created = Some(conn);
             active
         };
         tracing::info!(ssid, %active, "ActivateConnection issued (open)");
-        Ok(())
+        self.drop_profile_cache().await;
+        Ok(created)
     }
-    pub async fn connect_secure(&self, ssid: &str, psk: &str) -> Result<()> {
+    pub async fn discard_new_profile(&self, ssid: &str) {
+        if let Ok(Some(path)) = super::saved_profile_path(self.system_conn(), ssid).await
+            && let Ok(proxy) = rusty_network_manager::SettingsConnectionProxy::new_from_path(
+                path,
+                self.system_conn(),
+            )
+            .await
+        {
+            match proxy.delete().await {
+                Ok(()) => tracing::info!(ssid, "discarded new profile after failed connect"),
+                Err(e) => tracing::warn!(ssid, "could not discard new profile: {e}"),
+            }
+        }
+        self.drop_profile_cache().await;
+    }
+    pub async fn connect_secure(&self, ssid: &str, psk: &str) -> Result<Option<OwnedObjectPath>> {
         validate_psk(psk)?;
+        self.disconnect_other_wifi(ssid).await?;
         let wifi = self
             .wifi_device_path()
             .await?
             .context("no Wi-Fi device found")?;
         let ap = self.ap_path_for_ssid(&wifi, ssid).await?;
         let existing = super::saved_profile_path(self.system_conn(), ssid).await?;
+        let mut created = None;
         let active = if let Some(profile) = existing {
             self.update_psk(&profile, psk).await?;
             self.nm.activate_connection(&profile, &wifi, &ap).await?
         } else {
             let profile = secure_profile(ssid, psk);
-            let (conn, active) = self
+            match self
                 .nm
                 .add_and_activate_connection(profile, &wifi, &ap)
-                .await?;
-            tracing::info!(ssid, %conn, "AddAndActivateConnection issued (secure, new profile)");
-            active
+                .await
+            {
+                Ok((conn, active)) => {
+                    tracing::info!(ssid, %conn, "AddAndActivateConnection issued (secure, new profile)");
+                    created = Some(conn);
+                    active
+                }
+                Err(e) => {
+                    self.discard_new_profile(ssid).await;
+                    return Err(anyhow::Error::from(e));
+                }
+            }
         };
         tracing::info!(ssid, %active, "ActivateConnection issued (secure)");
-        Ok(())
+        self.drop_profile_cache().await;
+        Ok(created)
     }
     pub async fn connect_hidden(&self, ssid: &str, psk: &str) -> Result<()> {
         if !psk.is_empty() {
             validate_psk(psk)?;
         }
+        self.disconnect_other_wifi(ssid).await?;
         let wifi = self
             .wifi_device_path()
             .await?
@@ -169,19 +202,39 @@ impl NmClient {
         let root = root_path()?;
         let active = self.nm.activate_connection(&profile, &wifi, &root).await?;
         tracing::info!(ssid, %active, "ActivateConnection issued (hidden)");
+        self.drop_profile_cache().await;
         Ok(())
     }
-    async fn update_psk(&self, profile: &OwnedObjectPath, psk: &str) -> Result<()> {
+    pub async fn update_psk(&self, profile: &OwnedObjectPath, psk: &str) -> Result<()> {
         let proxy = rusty_network_manager::SettingsConnectionProxy::new_from_path(
             profile.clone(),
             self.system_conn(),
         )
         .await?;
-        let mut sec = HashMap::new();
-        sec.insert("psk", Value::new(psk));
-        let mut outer: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
-        outer.insert("802-11-wireless-security", sec);
-        proxy.update(outer).await?;
+
+        let mut map = super::get_settings(self.system_conn(), profile)
+            .await
+            .context("could not read the saved profile")?;
+        if !map.contains_key("connection") {
+            anyhow::bail!("saved profile has no connection group; refusing to rewrite it");
+        }
+        let new_secret = zbus::zvariant::OwnedValue::try_from(Value::new(psk))
+            .context("could not encode the new password")?;
+        map.entry("802-11-wireless-security".to_string())
+            .or_default()
+            .insert("psk".to_string(), new_secret);
+        let mut full: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
+        for (group, values) in &map {
+            let mut row: HashMap<&str, Value> = HashMap::new();
+            for (key, value) in values {
+                row.insert(
+                    key.as_str(),
+                    Value::try_from(value).context("could not re-encode the saved profile")?,
+                );
+            }
+            full.insert(group.as_str(), row);
+        }
+        proxy.update(full).await?;
         tracing::info!(%profile, "saved profile password updated");
         Ok(())
     }
@@ -196,9 +249,11 @@ impl NmClient {
         .await?;
         proxy.delete().await?;
         tracing::info!(ssid, %path, "saved profile deleted");
+        self.drop_profile_cache().await;
         Ok(())
     }
-    pub async fn connect_saved(&self, ssid: &str) -> Result<()> {
+    pub async fn connect_saved(&self, ssid: &str) -> Result<Option<OwnedObjectPath>> {
+        self.disconnect_other_wifi(ssid).await?;
         let profile = super::saved_profile_path(self.system_conn(), ssid)
             .await?
             .with_context(|| format!("no saved profile for {ssid}"))?;
@@ -207,10 +262,112 @@ impl NmClient {
             .await?
             .context("no Wi-Fi device found")?;
         let ap = self.ap_path_for_ssid(&wifi, ssid).await?;
-        let active = self.nm.activate_connection(&profile, &wifi, &ap).await?;
+        tracing::info!(ssid, %profile, %wifi, %ap, "activating saved profile");
+        let active = self
+            .nm
+            .activate_connection(&profile, &wifi, &ap)
+            .await
+            .with_context(|| format!("ActivateConnection failed for saved {ssid}"))?;
         tracing::info!(ssid, %active, "ActivateConnection issued (saved)");
-        Ok(())
+        Ok(None)
     }
+
+    pub async fn retry_saved_with_psk(&self, ssid: &str, psk: &str) -> Result<SavedRetry> {
+        validate_psk(psk)?;
+        self.disconnect_other_wifi(ssid).await?;
+        let profile = super::saved_profile_path(self.system_conn(), ssid)
+            .await?
+            .with_context(|| format!("no saved profile for {ssid}"))?;
+        let old_psk =
+            super::profiles::load_wireless_settings(self.system_conn(), vec![profile.clone()])
+                .await
+                .into_iter()
+                .next()
+                .and_then(|(_, map)| super::profiles::profile_psk(&map));
+        let rollback = old_psk.clone().map(|old| (profile.clone(), old));
+        tracing::info!(
+            ssid,
+            %profile,
+            new_len = psk.len(),
+            old_len = rollback.as_ref().map(|(_, p)| p.len()),
+            "saved profile selected; writing the new password"
+        );
+        self.update_psk(&profile, psk).await?;
+        match self.connect_saved(ssid).await {
+            Ok(created) => Ok(SavedRetry { created, rollback }),
+            Err(e) => {
+                tracing::warn!(
+                    ssid,
+                    "first activation after password change failed: {e:#}; retrying once"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                match self.connect_saved(ssid).await {
+                    Ok(created) => Ok(SavedRetry { created, rollback }),
+                    Err(e) => {
+                        if let Some((profile, old)) = &rollback {
+                            let _ = self.update_psk(profile, old).await;
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn connect_saved_with_psk(
+        &self,
+        ssid: &str,
+        psk: &str,
+    ) -> Result<Option<OwnedObjectPath>> {
+        validate_psk(psk)?;
+        let profile = super::saved_profile_path(self.system_conn(), ssid)
+            .await?
+            .with_context(|| format!("no saved profile for {ssid}"))?;
+        self.update_psk(&profile, psk).await?;
+        self.connect_saved(ssid).await
+    }
+
+    pub async fn disconnect_other_wifi(&self, keep_ssid: &str) -> Result<bool> {
+        use rusty_network_manager::ActiveProxy;
+        let mut dropped = false;
+        for path in self.nm.active_connections().await.unwrap_or_default() {
+            let Ok(proxy) = ActiveProxy::new_from_path(path.clone(), self.system_conn()).await
+            else {
+                continue;
+            };
+            if proxy.type_().await.as_deref() != Ok("802-11-wireless")
+                || proxy.state().await.unwrap_or(0) != 2
+            {
+                continue;
+            }
+            if super::active_conn_is_hotspot(self.system_conn(), &path).await {
+                continue;
+            }
+            let Ok(profile) = proxy.connection().await else {
+                continue;
+            };
+            let Some(map) = super::get_settings(self.system_conn(), &profile).await else {
+                continue;
+            };
+            match super::profiles::wireless_ssid(&map) {
+                Some(ssid) if ssid == keep_ssid => continue,
+                None => continue,
+                Some(_) => {}
+            }
+            match self.nm.deactivate_connection(&path).await {
+                Ok(()) => {
+                    tracing::info!(%path, "stepping aside from the active network");
+                    dropped = true;
+                }
+                Err(e) => tracing::warn!(%path, "deactivate before switch failed: {e:#}"),
+            }
+        }
+        if dropped {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        }
+        Ok(dropped)
+    }
+
     pub async fn disconnect_active(&self) -> Result<()> {
         use rusty_network_manager::ActiveProxy;
         for path in self.nm.active_connections().await.unwrap_or_default() {
@@ -218,29 +375,34 @@ impl NmClient {
             else {
                 continue;
             };
-            if proxy
-                .type_()
-                .await
-                .map(|t| t == "802-11-wireless")
-                .unwrap_or(false)
-            {
-                if super::active_conn_is_hotspot(self.system_conn(), &path).await {
-                    continue;
-                }
-                self.nm.deactivate_connection(&path).await?;
-                tracing::info!(%path, "DeactivateConnection issued");
-                return Ok(());
+            if !matches!(
+                proxy.type_().await.as_deref(),
+                Ok("802-11-wireless") | Ok("802-3-ethernet")
+            ) {
+                continue;
             }
+            if super::active_conn_is_hotspot(self.system_conn(), &path).await {
+                continue;
+            }
+            self.nm.deactivate_connection(&path).await?;
+            tracing::info!(%path, "DeactivateConnection issued");
+            return Ok(());
         }
         anyhow::bail!("no active Wi-Fi connection to disconnect");
     }
     pub async fn activate_vpn(&self, id: &str) -> Result<()> {
-        let profile = super::profiles::vpn_profile_path(self.system_conn(), id)
+        let profile = self
+            .vpn_connections()
             .await?
+            .into_iter()
+            .find(|v| v.id == id)
+            .map(|v| OwnedObjectPath::try_from(v.path.as_str()))
+            .transpose()?
             .with_context(|| format!("no saved VPN profile for {id}"))?;
         let root = OwnedObjectPath::try_from("/").context("invalid root object path")?;
         let active = self.nm.activate_connection(&profile, &root, &root).await?;
         tracing::info!(id, %active, "ActivateConnection issued (vpn)");
+        self.drop_profile_cache().await;
         Ok(())
     }
     pub async fn deactivate_vpn(&self, id: &str) -> Result<()> {
@@ -250,7 +412,7 @@ impl NmClient {
             else {
                 continue;
             };
-            if proxy.type_().await.as_deref() != Ok("vpn") {
+            if !matches!(proxy.type_().await.as_deref(), Ok("vpn") | Ok("wireguard")) {
                 continue;
             }
             let name = proxy.id().await.unwrap_or_default();
@@ -259,6 +421,7 @@ impl NmClient {
             }
             self.nm.deactivate_connection(&path).await?;
             tracing::info!(id, %path, "DeactivateConnection issued (vpn)");
+            self.drop_profile_cache().await;
             return Ok(());
         }
         anyhow::bail!("vpn {id} is not active");
@@ -349,55 +512,73 @@ pub struct PrevWifi {
     pub profile: zbus::zvariant::OwnedObjectPath,
     pub ssid: String,
 }
+#[allow(clippy::too_many_arguments)]
+pub struct SavedRetry {
+    pub created: Option<OwnedObjectPath>,
+    pub rollback: Option<(OwnedObjectPath, String)>,
+}
+
+pub const MSG_FAILED: &str = "Couldn't connect";
+pub const MSG_WRONG_PASSWORD: &str = "Incorrect password";
+
+pub struct GuardOpts {
+    pub target_ssid: String,
+    pub prev: Option<PrevWifi>,
+    pub window: Duration,
+    pub registry: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    pub created: Option<OwnedObjectPath>,
+    pub manual: Arc<std::sync::atomic::AtomicBool>,
+
+    pub rollback_psk: Option<(OwnedObjectPath, String)>,
+}
+
 pub fn spawn_restore_guard(
     client: Arc<NmClient>,
     mut watch_rx: ModelRx,
     feed: async_channel::Sender<crate::state::UiEvent>,
-    target_ssid: String,
-    prev: Option<PrevWifi>,
-    window: Duration,
-    registry: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    opts: GuardOpts,
 ) {
-    let prev_ssid = prev.as_ref().map(|p| p.ssid.clone());
-    if prev.is_none() {
-        tokio::spawn(async move {
-            let _ = &registry;
-            match client.restore_by_priority(&target_ssid).await {
-                Ok(Some(ssid)) => {
-                    let _ = feed.try_send(crate::state::UiEvent::SsidError {
-                        ssid: target_ssid,
-                        message: format!("Could not connect. Reconnected to “{ssid}”."),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("priority fallback failed: {e:#}"),
-            }
-        });
-        return;
-    }
-    let prev = prev.expect("checked above");
+    let GuardOpts {
+        target_ssid,
+        prev,
+        window,
+        registry,
+        created,
+        manual,
+        rollback_psk,
+    } = opts;
     tokio::spawn(async move {
-        {
+        let generation = {
             let mut seen = registry.lock().await;
-            if !seen.insert(target_ssid.clone()) {
-                return;
+            let slot = seen.entry(target_ssid.clone()).or_insert(0);
+            *slot += 1;
+            if *slot > 1 {
+                tracing::info!(ssid = %target_ssid, generation = *slot, "newer attempt takes over this network");
             }
-        }
+            *slot
+        };
         let guard = GuardGuard {
             registry: registry.clone(),
             ssid: target_ssid.clone(),
+            generation,
         };
         let _ = &guard;
         let deadline = tokio::time::Instant::now() + window;
         let mut none_since: Option<tokio::time::Instant> = None;
         let mut saw_disconnect = false;
         loop {
+            if registry.lock().await.get(&target_ssid).copied() != Some(generation) {
+                tracing::info!(ssid = %target_ssid, "a newer attempt owns this network; standing down");
+                return;
+            }
+            let mut connected = false;
             {
                 let m = watch_rx.borrow();
                 match m.active_ssid.as_deref() {
-                    Some(s) if s == target_ssid.as_str() => return,
-                    Some(s) if s == prev.ssid.as_str() && saw_disconnect => return,
-                    Some(_) if saw_disconnect => return,
+                    Some(s) if s == target_ssid.as_str() => {
+                        connected = true;
+                    }
+                    Some(_) if saw_disconnect => break,
                     None => {
                         saw_disconnect = true;
                         if none_since.is_none() {
@@ -417,63 +598,108 @@ pub fn spawn_restore_guard(
                     return;
                 }
             }
+            if connected {
+                client.mark_connected(&target_ssid).await;
+                return;
+            }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            if tokio::time::timeout(Duration::from_millis(500), watch_rx.changed())
-                .await
-                .is_err()
-            {
-                return;
+            let _ = tokio::time::timeout(Duration::from_millis(500), watch_rx.changed()).await;
+        }
+        if watch_rx.borrow().active_ssid.as_deref() == Some(target_ssid.as_str()) {
+            return;
+        }
+        if let Some((profile, old_psk)) = rollback_psk {
+            match client.update_psk(&profile, &old_psk).await {
+                Ok(()) => tracing::info!(
+                    ssid = %target_ssid,
+                    "attempt failed; previous saved password restored"
+                ),
+                Err(e) => tracing::warn!("could not restore previous password: {e:#}"),
             }
         }
-        match client.reactivate_previous(&prev.ssid, &prev.profile).await {
-            Ok(()) => {
-                let _ = feed.try_send(crate::state::UiEvent::SsidError {
-                    ssid: target_ssid.clone(),
-                    message: format!(
-                        "Could not connect to “{target_ssid}”. Reconnected to “{}”.",
-                        prev.ssid
-                    ),
-                });
+        if let Some(path) = created {
+            tracing::info!(ssid = %target_ssid, %path, "connect failed; removing profile we created");
+            if let Ok(proxy) = rusty_network_manager::SettingsConnectionProxy::new_from_path(
+                path,
+                client.system_conn(),
+            )
+            .await
+                && let Err(e) = proxy.delete().await
+            {
+                tracing::warn!("could not remove failed profile: {e}");
             }
-            Err(e) => {
-                tracing::warn!("failed to restore previous network {}: {e:#}", prev.ssid);
-                let target = target_ssid.clone();
+        }
+        if manual.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(ssid = %target_ssid, "manual disconnect seen; not restoring previous");
+            return;
+        }
+        match &prev {
+            Some(p) => match client.reactivate_previous(&p.ssid, &p.profile).await {
+                Ok(()) => {
+                    tracing::info!(restored = %p.ssid, "restored previous network");
+                    let _ = feed.try_send(crate::state::UiEvent::SsidError {
+                        ssid: target_ssid.clone(),
+                        message: MSG_FAILED.into(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("failed to restore previous network {}: {e:#}", p.ssid);
+                    let target = target_ssid.clone();
+                    match client.restore_by_priority(&target_ssid).await {
+                        Ok(Some(ssid)) => {
+                            tracing::info!(restored = %ssid, "restored a network by priority");
+                            let _ = feed.try_send(crate::state::UiEvent::SsidError {
+                                ssid: target,
+                                message: MSG_FAILED.into(),
+                            });
+                        }
+                        _ => {
+                            tracing::info!("no saved network left to fall back to");
+                            let _ = feed.try_send(crate::state::UiEvent::SsidError {
+                                ssid: target,
+                                message: MSG_FAILED.into(),
+                            });
+                        }
+                    }
+                }
+            },
+            None => {
+                if watch_rx.borrow().active_ssid.is_some() {
+                    return;
+                }
                 match client.restore_by_priority(&target_ssid).await {
                     Ok(Some(ssid)) => {
+                        tracing::info!(restored = %ssid, "restored a network by priority");
                         let _ = feed.try_send(crate::state::UiEvent::SsidError {
-                            ssid: target,
-                            message: format!(
-                                "Could not connect to “{target_ssid}”. Reconnected to “{ssid}”."
-                            ),
+                            ssid: target_ssid,
+                            message: MSG_FAILED.into(),
                         });
                     }
-                    _ => {
-                        let _ = feed.try_send(crate::state::UiEvent::SsidError {
-                            ssid: target,
-                            message: format!(
-                                "Could not connect to “{target_ssid}”. Reconnect to “{}” manually.",
-                                prev_ssid.unwrap_or_else(|| "a saved network".into())
-                            ),
-                        });
-                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("priority fallback failed: {e:#}"),
                 }
             }
         }
     });
 }
 struct GuardGuard {
-    registry: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    registry: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
     ssid: String,
+    generation: u64,
 }
 impl Drop for GuardGuard {
     fn drop(&mut self) {
         let reg = self.registry.clone();
         let ssid = self.ssid.clone();
+        let generation = self.generation;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                reg.lock().await.remove(&ssid);
+                let mut map = reg.lock().await;
+                if map.get(&ssid).copied() == Some(generation) {
+                    map.remove(&ssid);
+                }
             });
         }
     }

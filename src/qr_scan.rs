@@ -218,6 +218,14 @@ fn open_camera(
     };
     let attempts: Vec<(&str, RequestedFormatType)> = vec![
         (
+            "480p-yuyv",
+            RequestedFormatType::Closest(CameraFormat::new(
+                Resolution::new(640, 480),
+                FrameFormat::YUYV,
+                30,
+            )),
+        ),
+        (
             "720p-mjpeg",
             RequestedFormatType::Closest(CameraFormat::new(
                 Resolution::new(1280, 720),
@@ -235,14 +243,6 @@ fn open_camera(
         ),
         ("default", RequestedFormatType::None),
         ("high-res", RequestedFormatType::AbsoluteHighestResolution),
-        (
-            "480p-yuyv",
-            RequestedFormatType::Closest(CameraFormat::new(
-                Resolution::new(640, 480),
-                FrameFormat::YUYV,
-                30,
-            )),
-        ),
         ("high-fps", RequestedFormatType::AbsoluteHighestFrameRate),
     ];
     let mut last_err = String::from("no formats attempted");
@@ -322,15 +322,26 @@ fn camera_loop(
                 continue;
             }
         };
+        let mjpeg = (frame.source_frame_format() == nokhwa::utils::FrameFormat::MJPEG)
+            .then(|| frame.buffer().to_vec());
         let img = match frame.decode_image::<RgbFormat>() {
             Ok(i) => i,
             Err(e) => {
-                decode_errors += 1;
-                if decode_errors == 5 {
-                    say(format!("Camera format unsupported: {e}"));
+                let fallback = mjpeg
+                    .as_deref()
+                    .and_then(|b| image::load_from_memory(b).ok())
+                    .map(|i| i.to_rgb8());
+                match fallback {
+                    Some(decoded) => decoded,
+                    None => {
+                        decode_errors += 1;
+                        if decode_errors == 5 {
+                            say(format!("Camera format unsupported: {e}"));
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
             }
         };
         let (w, h) = (img.width(), img.height());
@@ -376,7 +387,16 @@ pub fn camera_self_test() -> anyhow::Result<()> {
     println!("using camera: {camera_name}");
     for i in 0..5 {
         let frame = cam.frame()?;
-        let img = frame.decode_image::<RgbFormat>()?;
+        let img = match frame.decode_image::<RgbFormat>() {
+            Ok(i) => i,
+            Err(e) => match image::load_from_memory(frame.buffer())
+                .ok()
+                .map(|i| i.to_rgb8())
+            {
+                Some(decoded) => decoded,
+                None => return Err(e.into()),
+            },
+        };
         let (w, h) = (img.width(), img.height());
         let raw = img.into_raw();
         println!(
@@ -410,7 +430,7 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
             let g = mon.geometry();
             (g.width(), g.height())
         })
-        .unwrap_or((1920, 1080));
+        .unwrap_or((0, 0));
     let w = 480;
     let h = 560;
     window.set_default_size(w, h);
