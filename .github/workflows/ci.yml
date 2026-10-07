@@ -77,11 +77,19 @@ jobs:
             rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz.sha256
       - name: point install script at the new release
         if: steps.ver.outputs.bump == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd "${GITHUB_WORKSPACE}"
-          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-          git rev-parse --is-inside-work-tree
+          set -u
           VER="${{ steps.ver.outputs.version }}"
+          SHA_FILE="${GITHUB_WORKSPACE}/rnetapplet-$VER-x86_64-linux.tar.gz.sha256"
+          [ -f "$SHA_FILE" ] || { echo "missing $SHA_FILE"; exit 1; }
+          SHA=$(cut -d' ' -f1 "$SHA_FILE")
+          rm -rf .readme-bump
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .readme-bump
+          cd .readme-bump
+          git checkout main
+          python3 - "$VER" "$SHA" <<'EOF'
           SHA=$(cut -d' ' -f1 "rnetapplet-$VER-x86_64-linux.tar.gz.sha256")
           python3 - "$VER" "$SHA" <<'EOF'
           import re, sys
