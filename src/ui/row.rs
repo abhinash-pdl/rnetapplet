@@ -8,7 +8,7 @@ use super::state::UiHandles;
 use super::theme::{net_icon_live, themed_icon};
 use crate::state::{Ap, BackendCmd};
 
-pub(crate) const SSID_CHARS: i32 = 22;
+pub(crate) const SSID_CHARS: i32 = 18;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -43,10 +43,13 @@ pub(crate) fn flat_icon_button(icon: &str, pixel: i32, tooltip: &str) -> gtk4::B
     let img = gtk4::Image::from_icon_name(&themed_icon(&[icon]));
     img.set_pixel_size(pixel);
     img.set_valign(gtk4::Align::Center);
+    img.set_halign(gtk4::Align::Center);
     let btn = gtk4::Button::new();
     btn.set_child(Some(&img));
     btn.add_css_class("flat");
+    btn.add_css_class("rnet-hbtn");
     btn.set_valign(gtk4::Align::Center);
+    btn.set_halign(gtk4::Align::Center);
     btn.set_tooltip_text(Some(tooltip));
     btn.set_focusable(false);
     btn.set_focus_on_click(false);
@@ -120,6 +123,14 @@ pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
     }
     for (ssid, (btn, home, anchor)) in h.action_btns.borrow().iter() {
         let _ = &anchor;
+        if h.model
+            .borrow()
+            .aps
+            .iter()
+            .any(|ap| &ap.ssid == ssid && !ap.secured)
+        {
+            continue;
+        }
         let open = target == Some(ssid.as_str());
         let Some(actions) = h.card_actions.borrow().get(ssid).cloned() else {
             continue;
@@ -141,19 +152,22 @@ pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
         }
     }
     if let Some(ssid) = target {
-        let rev = h.revealers.borrow().get(ssid).cloned();
         let entry = h.pw_entries.borrow().get(ssid).cloned();
-        if let (Some(rev), Some(entry)) = (rev, entry) {
-            let done = std::cell::Cell::new(false);
-            rev.connect_child_revealed_notify(move |r| {
-                if done.get() || !r.is_child_revealed() {
-                    return;
-                }
-                done.set(true);
-                if entry.is_mapped() {
-                    entry.grab_focus();
-                }
-            });
+        if let Some(entry) = entry {
+            let h2 = h.clone();
+            let expanded = h.expanded.clone();
+            let ssid = ssid.to_string();
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(crate::ui::motion::REVEAL_MS as u64 + 180),
+                move || {
+                    if !h2.visible.get() || h2.any_entry_focused() {
+                        return;
+                    }
+                    if expanded.borrow().as_deref() == Some(ssid.as_str()) && entry.is_mapped() {
+                        entry.grab_focus();
+                    }
+                },
+            );
         }
     }
 }
@@ -177,6 +191,9 @@ pub(crate) fn show_error_label(h: &UiHandles, ssid: &str, message: Option<&str>)
 
 pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
     let target = ssid.map(|s| s.to_string());
+    if target.is_some() && h.hidden_expanded.get() {
+        super::hidden::collapse_hidden(h);
+    }
     let previous = h.expanded.borrow().clone();
     *h.focus_ssid.borrow_mut() = target.clone();
     *h.expanded.borrow_mut() = target.clone();
@@ -231,6 +248,23 @@ pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
         }
     };
     (h.grow)(reserved);
+    if let Some(ssid) = target.as_deref()
+        && let Some(row) = h.rows.borrow().get(ssid).cloned()
+        && let Some(bounds) = row.compute_bounds(&h.list)
+    {
+        let adj = h.scroll.vadjustment();
+        let page = adj.page_size();
+        if page > 0.0 {
+            let top = f64::from(bounds.y());
+            let bottom = top + f64::from(bounds.height()) + reserved as f64;
+            let max = (adj.upper() - page).max(0.0);
+            if bottom > adj.value() + page {
+                adj.set_value((bottom - page).clamp(0.0, max));
+            } else if top < adj.value() {
+                adj.set_value(top.clamp(0.0, max));
+            }
+        }
+    }
     h.anim_until
         .set(gtk4::glib::monotonic_time() / 1000 + crate::ui::motion::REVEAL_MS as i64);
     (h.fit)();
@@ -275,6 +309,18 @@ pub(crate) fn clear_stale_errors(h: &UiHandles, keep: Option<&str>) {
 pub(crate) fn set_row_connecting(h: &UiHandles, ssid: &str, on: bool) {
     if let Some(status) = h.status.borrow().get(ssid) {
         status.set_visible(on);
+        let mut child = status.first_child();
+        while let Some(w) = child {
+            if let Some(spin) = w.downcast_ref::<gtk4::Spinner>() {
+                if on {
+                    spin.start();
+                } else {
+                    spin.stop();
+                }
+                break;
+            }
+            child = w.next_sibling();
+        }
     }
     if let Some((btn, _, _)) = h.action_btns.borrow().get(ssid) {
         btn.set_sensitive(!on);
@@ -503,6 +549,17 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
             .unwrap_or(false);
         if secured && typed {
             submit_password(&h2, &ssid, saved);
+        } else if !secured {
+            mark_connecting(&h2, &ssid, false, false);
+            set_row_connecting(&h2, &ssid, true);
+            if h2
+                .cmd_tx
+                .try_send(BackendCmd::ConnectOpen(ssid.clone()))
+                .is_err()
+            {
+                tracing::warn!(%ssid, "connect command dropped: backend channel full");
+                set_row_connecting(&h2, &ssid, false);
+            }
         } else if saved {
             mark_connecting(&h2, &ssid, false, false);
             set_row_connecting(&h2, &ssid, true);
@@ -697,7 +754,6 @@ pub(crate) fn ap_row(
     {
         let spin = gtk4::Spinner::new();
         spin.set_size_request(16, 16);
-
         if is_connecting {
             spin.start();
         }
@@ -720,14 +776,12 @@ pub(crate) fn ap_row(
         .insert(ap.ssid.clone(), card_actions.clone());
 
     if is_active {
-        if !expanded {
-            hbox.append(&action_button(
-                "Disconnect",
-                true,
-                BackendCmd::DisconnectActive,
-                h,
-            ));
-        }
+        hbox.append(&action_button(
+            "Disconnect",
+            true,
+            BackendCmd::DisconnectActive,
+            h,
+        ));
     } else {
         let action = connect_action_button(ap, h);
         let slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -736,7 +790,7 @@ pub(crate) fn ap_row(
             (action.clone(), hbox.clone(), slot.clone()),
         );
         hbox.append(&slot);
-        if expanded {
+        if expanded && ap.secured {
             card_actions.append(&action);
         } else {
             hbox.append(&action);
@@ -744,13 +798,11 @@ pub(crate) fn ap_row(
     }
     if ap.enterprise || ap.wep {
         add_badge(if ap.enterprise { "enterprise" } else { "WEP" });
-        if !expanded {
-            let cfg = gtk4::Button::with_label("Configure");
-            cfg.add_css_class("flat");
-            cfg.set_tooltip_text(Some("Open connection settings"));
-            cfg.connect_clicked(move |_| super::placement::open_editor());
-            hbox.append(&cfg);
-        }
+        let cfg = gtk4::Button::with_label("Configure");
+        cfg.add_css_class("flat");
+        cfg.set_tooltip_text(Some("Open connection settings"));
+        cfg.connect_clicked(move |_| super::placement::open_editor());
+        hbox.append(&cfg);
     }
 
     {
@@ -816,6 +868,10 @@ pub(crate) fn ap_row(
         l.set_halign(gtk4::Align::Start);
         l.add_css_class("dim-label");
         details.append(&l);
+        if ap.saved {
+            card_actions.append(&forget_button(ap, h));
+        }
+        details.append(&card_actions);
     } else if ap.enterprise || ap.wep {
         if let Some(e) = err.as_deref() {
             let el = gtk4::Label::new(Some(e));
@@ -834,6 +890,7 @@ pub(crate) fn ap_row(
         l.add_css_class("dim-label");
         l.set_wrap(true);
         details.append(&l);
+        details.append(&card_actions);
     } else {
         let err_label = {
             let el = gtk4::Label::new(Some(err.as_deref().unwrap_or("")));

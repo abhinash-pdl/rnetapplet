@@ -12,8 +12,12 @@ connections; everything happens inside the popup.
 ## Features
 
 - Nearby networks listed live with signal bands (2.4G/5G/6G), sorted by signal strength
+- Every network row expands to a details card — connect/forget, band,
+  saved state — so open and secured networks behave the same
 - One-click connect to saved or open networks; saved networks stay
   listed with connect/forget even out of range
+- Warns inside the popup and on the tray icon when a connection has no
+  internet access, and when NetworkManager is unavailable
 - Inline password entry — the applet acts as its own NetworkManager
   SecretAgent, so a wrong password can be retried without a dialog
 - Malformed passwords are rejected before they reach NetworkManager, and
@@ -25,7 +29,8 @@ connections; everything happens inside the popup.
 - QR-code connect from a webcam or an image file
 - Desktop notifications on connect/disconnect
 - Settings shortcut that opens the system `nm-connection-editor`
-- Tray icon follows the icon theme
+- Tray icon follows the icon theme and the real state: signal, wired,
+  hotspot, disconnected, no-internet, airplane mode
 - Saved VPN connections listed with connect/disconnect
 - Manual rescan button plus automatic live updates
 

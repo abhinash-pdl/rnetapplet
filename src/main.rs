@@ -1,3 +1,4 @@
+mod failover;
 mod nm_client;
 mod qr;
 mod qr_scan;
@@ -17,6 +18,8 @@ FLAGS:
     --dump-aps            Print visible access points and exit
     --camera-test         Probe the camera + QR decode path and exit
     --hotspot-test        Create a hotspot, observe, stop it, restore Wi-Fi, exit
+    --no-auto-failover    Disable automatic switch to a working saved network
+                        and automatic connect while disconnected
     -h, --help            Print this help
     -V, --version         Print version
 OPTIONS:
@@ -25,6 +28,7 @@ OPTIONS:
     --wifi <on|off>         Set the Wi-Fi radio and exit
 ENV:
     RUST_LOG                Tracing filter (default: info), e.g. RUST_LOG=rnetapplet=debug
+    RNETAPPLET_NO_AUTO_FAILOVER=1  Same as --no-auto-failover
 ";
 async fn shutdown_signal() {
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -126,6 +130,8 @@ fn main() -> Result<()> {
         tray_ev_rx,
         popup_visible.clone(),
         scan_frozen.clone(),
+        !args.iter().any(|a| a == "--no-auto-failover")
+            && std::env::var_os("RNETAPPLET_NO_AUTO_FAILOVER") != Some("1".into()),
     ));
     info!("starting layer-shell popup (main thread)");
     ui::run(
@@ -357,6 +363,13 @@ fn audit_icons() {
         "network-wireless-encrypted-symbolic",
         "network-wireless-symbolic",
         "network-wireless-hotspot-symbolic",
+        "network-wireless-offline-symbolic",
+        "network-wireless-disabled-symbolic",
+        "network-wireless-no-route-symbolic",
+        "network-wired-no-route-symbolic",
+        "network-wired-symbolic",
+        "network-offline-symbolic",
+        "network-error-symbolic",
         "airplane-mode-symbolic",
         "network-vpn-symbolic",
         "pan-down-symbolic",
@@ -440,6 +453,7 @@ async fn backend_main(
     tray_ev_rx: async_channel::Receiver<tray::TrayEvent>,
     popup_visible: Arc<AtomicBool>,
     scan_frozen: Arc<AtomicBool>,
+    auto_failover: bool,
 ) {
     let (watch_tx, watch_rx) = state::channel();
     let model: Arc<state::Model> = Arc::new(initial);
@@ -561,6 +575,18 @@ async fn backend_main(
     });
     let tray_handle: Arc<tokio::sync::OnceCell<ksni::Handle<tray::RnetTray>>> =
         Arc::new(tokio::sync::OnceCell::new());
+    let last_connect: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let last_manual_disconnect: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    if auto_failover {
+        failover::spawn(
+            watch_rx.clone(),
+            tray_ev_tx.clone(),
+            last_connect.clone(),
+            last_manual_disconnect.clone(),
+        );
+    }
     let _tray_task = {
         let tray_handle = tray_handle.clone();
         let tray_rx = watch_rx.clone();
@@ -627,20 +653,23 @@ async fn backend_main(
             manual_disconnect.store(false, Ordering::Relaxed);
             let outcome: anyhow::Result<Option<zbus::zvariant::OwnedObjectPath>> = $call.await;
             match outcome {
-                Ok(created) => nm_client::connect::spawn_restore_guard(
-                    client.clone(),
-                    watch_rx.clone(),
-                    model_feed.clone(),
-                    nm_client::connect::GuardOpts {
-                        target_ssid: $ssid.clone(),
-                        prev,
-                        window: std::time::Duration::from_secs(30),
-                        registry: guards.clone(),
-                        created,
-                        manual: manual_disconnect.clone(),
-                        rollback_psk: None,
-                    },
-                ),
+                Ok(created) => {
+                    *last_connect.lock().await = Some(std::time::Instant::now());
+                    nm_client::connect::spawn_restore_guard(
+                        client.clone(),
+                        watch_rx.clone(),
+                        model_feed.clone(),
+                        nm_client::connect::GuardOpts {
+                            target_ssid: $ssid.clone(),
+                            prev,
+                            window: std::time::Duration::from_secs(30),
+                            registry: guards.clone(),
+                            created,
+                            manual: manual_disconnect.clone(),
+                            rollback_psk: None,
+                        },
+                    )
+                }
                 Err(e) => {
                     tracing::warn!("connect {} failed: {e:#}", $ssid);
                     let _ = client.restore_previous(prev).await;
@@ -704,6 +733,7 @@ async fn backend_main(
                     state::BackendCmd::DisconnectActive => {
                         info!("disconnect requested");
                         manual_disconnect.store(true, Ordering::Relaxed);
+                        *last_manual_disconnect.lock().await = Some(std::time::Instant::now());
                         guards.lock().await.clear();
                         if let Err(e) = client.disconnect_active().await {
                             tracing::warn!("disconnect failed: {e:#}");

@@ -19,6 +19,7 @@ pub const NM_DEVICE_TYPE_WIFI: u32 = 2;
 const FANOUT: usize = 24;
 const SCAN_POLL: Duration = Duration::from_millis(250);
 const PROFILE_TTL: Duration = Duration::from_secs(30);
+const CONN_BAD_GRACE: Duration = Duration::from_secs(5);
 pub const SCAN_WAIT: Duration = Duration::from_secs(12);
 const STALE_HORIZON: Duration = Duration::from_secs(120);
 
@@ -58,6 +59,7 @@ pub struct NmClient {
     scan_completed: AtomicU64,
     connected_once: tokio::sync::RwLock<std::collections::BTreeSet<String>>,
     popup_visible: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    conn_bad_since: tokio::sync::Mutex<Option<Instant>>,
 }
 impl NmClient {
     pub async fn connect() -> Result<Self> {
@@ -77,6 +79,7 @@ impl NmClient {
             scan_completed: AtomicU64::new(0),
             connected_once: tokio::sync::RwLock::new(known::load()),
             popup_visible: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conn_bad_since: tokio::sync::Mutex::new(None),
         })
     }
     pub fn system_conn(&self) -> &Connection {
@@ -290,6 +293,9 @@ impl NmClient {
                     if profiles::is_hotspot_profile(&map) {
                         continue;
                     }
+                    if profile_unsaved(&self.system, &path).await {
+                        continue;
+                    }
                     if let Some(ssid) = profiles::wireless_ssid(&map) {
                         saved.insert(ssid, profiles::autoconnect_priority(&map));
                     }
@@ -340,6 +346,26 @@ impl NmClient {
         .await;
         Ok(ids.into_iter().flatten().next())
     }
+    pub async fn activating_ssid(&self) -> Result<Option<String>> {
+        let actives = self.nm.active_connections().await.unwrap_or_default();
+        let ids = map_bounded(actives, |path| {
+            let conn = self.system.clone();
+            async move {
+                let Ok(proxy) = ActiveProxy::new_from_path(path, &conn).await else {
+                    return None;
+                };
+                if proxy.state().await.unwrap_or(0) != 1 {
+                    return None;
+                }
+                if proxy.type_().await.as_deref() != Ok("802-11-wireless") {
+                    return None;
+                }
+                proxy.id().await.ok()
+            }
+        })
+        .await;
+        Ok(ids.into_iter().flatten().next())
+    }
     pub async fn vpn_connections(&self) -> Result<Vec<VpnConnection>> {
         Ok(self.profile_index().await.0)
     }
@@ -347,12 +373,19 @@ impl NmClient {
         let (wifi_enabled, networking_enabled) =
             futures::try_join!(self.nm.wireless_enabled(), self.nm.networking_enabled())
                 .unwrap_or((true, true));
+        let (connectivity, connectivity_check, primary_type) = futures::try_join!(
+            self.nm.connectivity(),
+            self.nm.connectivity_check_enabled(),
+            self.nm.primary_connection_type()
+        )
+        .unwrap_or((0, false, String::new()));
         let wifi_path = self.wifi_device_path().await?;
         let mut aps = Vec::new();
         if let Some(ref path) = wifi_path {
             aps = self.list_aps(path).await.unwrap_or_default();
         }
         let mut active_ssid = self.active_ssid().await.unwrap_or(None);
+        let activating_ssid = self.activating_ssid().await.unwrap_or(None);
         let vpn_connections = self.vpn_connections().await.unwrap_or_default();
         let (_, saved_profiles) = self.profile_index().await;
         let mut saved_ssids: Vec<String> = saved_profiles.into_keys().collect();
@@ -370,6 +403,7 @@ impl NmClient {
         Ok(Model {
             aps: aps.into(),
             active_ssid,
+            activating_ssid,
             active_iface: net.iface,
             active_ipv4: net.ipv4,
             active_bitrate_kbps: net.bitrate_kbps,
@@ -382,6 +416,19 @@ impl NmClient {
             wifi_enabled,
             networking_enabled,
             nm_online: true,
+            no_internet: {
+                let raw_bad = connectivity_check && matches!(connectivity, 1..=3);
+                let mut guard = self.conn_bad_since.lock().await;
+                let now = Instant::now();
+                if raw_bad {
+                    let since = *guard.get_or_insert(now);
+                    now.duration_since(since) >= CONN_BAD_GRACE
+                } else {
+                    *guard = None;
+                    false
+                }
+            },
+            primary_wired: primary_type == "802-3-ethernet",
             vpn_connections: vpn_connections.into(),
         })
     }
@@ -454,6 +501,27 @@ pub(crate) async fn get_settings(
         .await
         .ok()?;
     proxy.get_settings().await.ok()
+}
+pub(crate) async fn profile_unsaved(conn: &Connection, path: &OwnedObjectPath) -> bool {
+    use zbus::fdo::PropertiesProxy;
+    use zbus::names::InterfaceName;
+    let props = PropertiesProxy::builder(conn)
+        .destination("org.freedesktop.NetworkManager")
+        .and_then(|b| b.path(path.clone()));
+    let Ok(props) = props else {
+        return false;
+    };
+    let Ok(props) = props.build().await else {
+        return false;
+    };
+    let Ok(iface) = InterfaceName::try_from("org.freedesktop.NetworkManager.Settings.Connection")
+    else {
+        return false;
+    };
+    let Ok(value) = props.get(iface, "Unsaved").await else {
+        return false;
+    };
+    matches!(&*value, Value::Bool(true))
 }
 pub(crate) async fn saved_profile_path(
     conn: &Connection,

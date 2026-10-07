@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 
 use super::list::refresh_list;
 use super::placement::open_editor;
-use super::row::action_button;
+use super::row::{action_button, section_label};
 use super::state::UiHandles;
 use super::theme::themed_icon;
 use crate::state::BackendCmd;
@@ -87,9 +87,8 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
         {
             let h = h.clone();
             cancel.connect_clicked(move |_| {
-                h.hotspot_expanded.set(false);
                 h.hotspot_error.borrow_mut().take();
-                refresh_list(&h);
+                collapse_hotspot(&h);
             });
         }
         {
@@ -152,10 +151,10 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                     return;
                 }
                 h.hotspot_error.borrow_mut().take();
-                h.hotspot_expanded.set(false);
                 *h.hotspot_ssid.borrow_mut() = ssid.clone();
                 *h.hotspot_psk.borrow_mut() = psk.clone();
                 btn.grab_focus();
+                collapse_hotspot(&h);
                 let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot { ssid, psk });
             });
         }
@@ -171,4 +170,125 @@ pub(crate) fn hotspot_shown(h: &UiHandles) -> bool {
     h.hotspot_expanded.get()
         || UiHandles::hotspot_active(&h.model.borrow())
         || h.hotspot_error.borrow().is_some()
+}
+
+pub(crate) fn ensure_hotspot_card(h: &UiHandles) -> (gtk4::Revealer, gtk4::ListBoxRow) {
+    let build = || {
+        let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        holder.append(&section_label("Hotspot"));
+        holder.append(&hotspot_section_row(h));
+        let row = gtk4::ListBoxRow::new();
+        row.set_activatable(false);
+        row.set_selectable(false);
+        row.set_child(Some(&holder));
+        row
+    };
+    if let Some((rev, wrap)) = h.hotspot_card.borrow().clone() {
+        h.hotspot_entries.borrow_mut().clear();
+        rev.set_child(Some(&build()));
+        return (rev, wrap);
+    }
+    let rev = gtk4::Revealer::new();
+    rev.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+    rev.set_transition_duration(crate::ui::motion::REVEAL_MS);
+    rev.set_reveal_child(false);
+    rev.set_child(Some(&build()));
+    {
+        let expanded = h.hotspot_expanded.clone();
+        rev.connect_map(move |r| {
+            if expanded.get() {
+                r.set_reveal_child(true);
+            }
+        });
+    }
+    let wrap = gtk4::ListBoxRow::new();
+    wrap.set_activatable(false);
+    wrap.set_selectable(false);
+    wrap.set_child(Some(&rev));
+    let pair = (rev.clone(), wrap.clone());
+    *h.hotspot_card.borrow_mut() = Some(pair.clone());
+    pair
+}
+
+pub(crate) fn expand_hotspot(h: &UiHandles) {
+    if h.expanded.borrow().is_some() {
+        super::row::set_expanded(h, None);
+    }
+    if h.hidden_expanded.get() {
+        super::hidden::collapse_hidden(h);
+    }
+    h.hotspot_closing.set(false);
+    h.hotspot_expanded.set(true);
+    h.hotspot_error.borrow_mut().take();
+    let (rev, row) = ensure_hotspot_card(h);
+    h.anim_until
+        .set(gtk4::glib::monotonic_time() / 1000 + crate::ui::motion::REVEAL_MS as i64);
+    if row.parent().is_none() {
+        refresh_list(h);
+    }
+    let extra = rev
+        .child()
+        .filter(|_| h.scroll.width() > 0)
+        .map(|c| {
+            c.measure(gtk4::Orientation::Vertical, h.scroll.width())
+                .1
+                .max(0)
+        })
+        .unwrap_or(0);
+    if extra > 0 {
+        (h.grow)(extra);
+    }
+    if rev.is_mapped() {
+        rev.set_reveal_child(true);
+    }
+    let h2 = h.clone();
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(crate::ui::motion::REVEAL_MS as u64 + 40),
+        move || {
+            (h2.fit)();
+        },
+    );
+}
+
+pub(crate) fn collapse_hotspot(h: &UiHandles) {
+    h.hotspot_expanded.set(false);
+    h.hotspot_error.borrow_mut().take();
+    let card = h.hotspot_card.borrow().clone();
+    let Some((rev, _)) = card else {
+        refresh_list(h);
+        return;
+    };
+    h.hotspot_closing.set(true);
+    let card_h = rev
+        .child()
+        .filter(|_| h.scroll.width() > 0)
+        .map(|c| {
+            c.measure(gtk4::Orientation::Vertical, h.scroll.width())
+                .1
+                .max(0)
+        })
+        .unwrap_or(0);
+    h.anim_until
+        .set(gtk4::glib::monotonic_time() / 1000 + crate::ui::motion::REVEAL_MS as i64);
+    (h.grow)(0);
+    tracing::debug!(
+        reveals = rev.reveals_child(),
+        shown = rev.is_child_revealed(),
+        mapped = rev.is_mapped(),
+        card_h,
+        "collapsing hotspot card"
+    );
+    rev.set_reveal_child(false);
+    let h2 = h.clone();
+    let closing = h.hotspot_closing.clone();
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(
+            (crate::ui::motion::REVEAL_MS + crate::ui::motion::CLOSE_DELAY_MS + 20) as u64,
+        ),
+        move || {
+            closing.set(false);
+            refresh_list(&h2);
+            (h2.fit)();
+        },
+    );
 }

@@ -51,14 +51,6 @@ impl SizeAnim {
         }
     }
 
-    pub(crate) fn snap(&self, h: i32) {
-        self.stop();
-        self.from.set(h);
-        self.to.set(h);
-        self.cur.set(h);
-        (self.apply)(h);
-    }
-
     pub(crate) fn run(self: &Rc<Self>, to: i32) {
         self.stop();
         let from = self.cur.get();

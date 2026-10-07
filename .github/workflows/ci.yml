@@ -1,0 +1,98 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    if: "!contains(github.event.head_commit.message, 'skip ci')"
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install build dependencies
+        run: >
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4
+          gtk4-layer-shell clang pkgconf linux-api-headers v4l-utils
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'skip ci')
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install build dependencies
+        run: >
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4
+          gtk4-layer-shell clang pkgconf linux-api-headers v4l-utils
+      - uses: Swatinem/rust-cache@v2
+      - name: detect version bump
+        id: ver
+        run: |
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$VER" >/dev/null 2>&1; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: build release
+        if: steps.ver.outputs.bump == 'true'
+        run: cargo build --release
+      - name: package tarball
+        if: steps.ver.outputs.bump == 'true'
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          DIR="rnetapplet-$VER-x86_64-linux"
+          rm -rf "$DIR" "$DIR.tar.gz" "$DIR.tar.gz.sha256"
+          mkdir "$DIR"
+          install -Dm755 target/release/rnetapplet "$DIR/rnetapplet"
+          install -Dm644 packaging/rnetapplet.desktop "$DIR/rnetapplet.desktop"
+          install -Dm644 packaging/rnetapplet.service "$DIR/rnetapplet.service"
+          install -Dm644 README.md "$DIR/README.md"
+          install -Dm644 LICENSE-MIT "$DIR/LICENSE-MIT"
+          tar czf "$DIR.tar.gz" "$DIR"
+          (cd "$(dirname "$DIR.tar.gz")" && sha256sum "$(basename "$DIR.tar.gz")" > "$(basename "$DIR.tar.gz").sha256")
+          cat "$DIR.tar.gz.sha256"
+      - name: publish release
+        if: steps.ver.outputs.bump == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: rnetapplet ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz
+            rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz.sha256
+      - name: point install script at the new release
+        if: steps.ver.outputs.bump == 'true'
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          SHA=$(cut -d' ' -f1 "rnetapplet-$VER-x86_64-linux.tar.gz.sha256")
+          python3 - "$VER" "$SHA" <<'EOF'
+          import re, sys
+          ver, sha = sys.argv[1], sys.argv[2]
+          s = open("README.md").read()
+          s = re.sub(r"releases/download/v[0-9.]+/", f"releases/download/v{ver}/", s)
+          s = re.sub(r"rnetapplet-[0-9.]+-x86_64-linux", f"rnetapplet-{ver}-x86_64-linux", s)
+          s = re.sub(r'echo "[0-9a-f]{64}  rnetapplet\.tar\.gz"', f'echo "{sha}  rnetapplet.tar.gz"', s)
+          open("README.md", "w").write(s)
+          EOF
+          git diff --stat README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: point install script at v$VER [skip ci]" || exit 0
+          git pull --rebase origin main || true
+          git push origin HEAD:main

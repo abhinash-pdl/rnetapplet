@@ -4,7 +4,7 @@ use std::sync::Arc;
 use gtk4::prelude::*;
 
 use super::hidden::ensure_hidden_card;
-use super::hotspot::{hotspot_section_row, hotspot_shown};
+use super::hotspot::{ensure_hotspot_card, hotspot_shown};
 use super::row::{ActiveInfo, ap_row, expander, section_label, wired_row};
 use super::state::{UiHandles, structural_change};
 use super::vpn::vpn_row;
@@ -96,31 +96,6 @@ fn wifi_off_row(h: &UiHandles, airplane: bool) -> gtk4::ListBoxRow {
     row.set_selectable(false);
     row.set_child(Some(&holder));
     row
-}
-
-pub(crate) fn animated_card(rows: Vec<gtk4::Widget>) -> gtk4::ListBoxRow {
-    let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    for r in &rows {
-        holder.append(r);
-    }
-    let inner = gtk4::ListBoxRow::new();
-    inner.set_activatable(false);
-    inner.set_selectable(false);
-    inner.set_child(Some(&holder));
-    let rev = gtk4::Revealer::new();
-    rev.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-    rev.set_transition_duration(crate::ui::motion::REVEAL_MS);
-    rev.set_child(Some(&inner));
-    rev.set_reveal_child(false);
-    gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(8), {
-        let rev = rev.clone();
-        move || rev.set_reveal_child(true)
-    });
-    let wrap = gtk4::ListBoxRow::new();
-    wrap.set_activatable(false);
-    wrap.set_selectable(false);
-    wrap.set_child(Some(&rev));
-    wrap
 }
 
 pub(crate) fn update_strengths(h: &UiHandles, m: &Model) {
@@ -248,6 +223,10 @@ pub(crate) fn apply_model(h: &UiHandles, m: Arc<Model>) {
         *h.pending_model.borrow_mut() = Some(m);
         return;
     }
+    if !h.visible.get() {
+        ingest(h, m);
+        return;
+    }
     let old = h.model.borrow().clone();
     ingest(h, m);
     let structural = structural_change(&old, &h.model.borrow());
@@ -257,7 +236,8 @@ pub(crate) fn apply_model(h: &UiHandles, m: Arc<Model>) {
     }
     let now = h.model.borrow().clone();
     update_strengths(h, &now);
-    if reorder_rows(h, &wanted_order(h, &now)) {
+    if crate::ui::motion::now_ms() >= h.anim_until.get() && reorder_rows(h, &wanted_order(h, &now))
+    {
         h.prune_drafts();
     }
 }
@@ -272,11 +252,28 @@ pub(crate) fn request_rebuild(h: &UiHandles) {
     }
     let h = h.clone();
     gtk4::glib::idle_add_local_once(move || {
-        h.rebuild_queued.set(false);
         if h.refresh_blocked() || !h.visible.get() {
+            h.rebuild_queued.set(false);
             h.pending_rebuild.set(true);
             return;
         }
+        let wait = h.anim_until.get() - crate::ui::motion::now_ms();
+        if wait > 0 {
+            let h2 = h.clone();
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_millis((wait + 30) as u64),
+                move || {
+                    h2.rebuild_queued.set(false);
+                    if h2.refresh_blocked() || !h2.visible.get() {
+                        h2.pending_rebuild.set(true);
+                        return;
+                    }
+                    refresh_list(&h2);
+                },
+            );
+            return;
+        }
+        h.rebuild_queued.set(false);
         refresh_list(&h);
     });
 }
@@ -309,7 +306,9 @@ pub(crate) fn teardown(h: &UiHandles) {
     *h.hidden_card.borrow_mut() = None;
     h.hidden_expanded.set(false);
     h.hidden_closing.set(false);
-    h.hotspot_was.set(false);
+    *h.hotspot_card.borrow_mut() = None;
+    h.hotspot_expanded.set(false);
+    h.hotspot_closing.set(false);
     h.hidden_entries.borrow_mut().clear();
     h.ap_misses.borrow_mut().clear();
     h.pw_hovered.set(false);
@@ -323,6 +322,7 @@ pub(crate) fn schedule_teardown(h: &UiHandles) {
     gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
         if !h.visible.get() {
             teardown(&h);
+            super::placement::trim_memory();
         }
     });
 }
@@ -437,18 +437,8 @@ pub(crate) fn refresh_list(h: &UiHandles) {
     }
 
     if hotspot_shown(h) {
-        let hs_first = !h.hotspot_was.replace(true);
-        if hs_first {
-            h.list.append(&animated_card(vec![
-                section_label("Hotspot").upcast(),
-                hotspot_section_row(h).upcast(),
-            ]));
-        } else {
-            h.list.append(&section_label("Hotspot"));
-            h.list.append(&hotspot_section_row(h));
-        }
-    } else {
-        h.hotspot_was.set(false);
+        let (_, row) = ensure_hotspot_card(h);
+        h.list.append(&row);
     }
 
     if let Some(ssid) = v.active {
@@ -560,6 +550,47 @@ pub(crate) fn refresh_list(h: &UiHandles) {
         child = c.next_sibling();
     }
     tracing::debug!(rows, active = ?h.model.borrow().active_ssid, "list rebuilt");
+    if h.visible.get() {
+        if let Some(k) = exp {
+            let child = h.revealers.borrow().get(&k).and_then(|r| r.child());
+            let extra = match child {
+                Some(c) if h.scroll.width() > 0 => c
+                    .measure(gtk4::Orientation::Vertical, h.scroll.width())
+                    .1
+                    .max(0),
+                _ => h.extra_heights.borrow().get(&k).copied().unwrap_or(0),
+            };
+            (h.grow)(extra);
+        } else if h.hidden_expanded.get() {
+            let child = h
+                .hidden_card
+                .borrow()
+                .as_ref()
+                .and_then(|(r, _)| r.child())
+                .filter(|_| h.scroll.width() > 0);
+            if let Some(c) = child {
+                let extra = c
+                    .measure(gtk4::Orientation::Vertical, h.scroll.width())
+                    .1
+                    .max(0);
+                (h.grow)(extra);
+            }
+        } else if h.hotspot_expanded.get() {
+            let child = h
+                .hotspot_card
+                .borrow()
+                .as_ref()
+                .and_then(|(r, _)| r.child())
+                .filter(|_| h.scroll.width() > 0);
+            if let Some(c) = child {
+                let extra = c
+                    .measure(gtk4::Orientation::Vertical, h.scroll.width())
+                    .1
+                    .max(0);
+                (h.grow)(extra);
+            }
+        }
+    }
     (h.fit)();
 }
 

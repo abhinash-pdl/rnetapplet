@@ -18,6 +18,8 @@ pub(crate) struct UiHandles {
 
     pub grow: Rc<dyn Fn(i32)>,
 
+    pub grow_by: Rc<dyn Fn(i32)>,
+
     pub anim_until: Rc<Cell<i64>>,
 
     pub extra_heights: Rc<RefCell<HashMap<String, i32>>>,
@@ -37,10 +39,11 @@ pub(crate) struct UiHandles {
     pub hidden_expanded: Rc<Cell<bool>>,
     pub hidden_closing: Rc<Cell<bool>>,
     pub hidden_card: Rc<RefCell<Option<(gtk4::Revealer, gtk4::ListBoxRow)>>>,
+    pub hotspot_card: Rc<RefCell<Option<(gtk4::Revealer, gtk4::ListBoxRow)>>>,
+    pub hotspot_closing: Rc<Cell<bool>>,
     pub hidden_error: Rc<RefCell<Option<String>>>,
     pub hotspot_error: Rc<RefCell<Option<String>>>,
     pub hotspot_expanded: Rc<Cell<bool>>,
-    pub hotspot_was: Rc<Cell<bool>>,
     pub hotspot_ssid: Rc<RefCell<String>>,
     pub hotspot_psk: Rc<RefCell<String>>,
     pub speeds: Rc<RefCell<(Option<u64>, Option<u64>)>>,
@@ -256,9 +259,11 @@ impl UiHandles {
 
 pub(crate) fn shell_equivalent(a: &Model, b: &Model) -> bool {
     a.active_ssid == b.active_ssid
+        && a.activating_ssid == b.activating_ssid
         && a.active_iface == b.active_iface
         && a.active_ipv4 == b.active_ipv4
         && a.nm_online == b.nm_online
+        && a.no_internet == b.no_internet
         && a.wifi_enabled == b.wifi_enabled
         && a.networking_enabled == b.networking_enabled
         && a.wired == b.wired

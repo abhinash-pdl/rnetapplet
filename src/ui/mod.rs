@@ -44,6 +44,9 @@ window.rnet-window, window.rnet-window > .background, window.rnet-window:backdro
  .rnet-window scrolledwindow > overshoot { background: transparent; box-shadow: none; }
  .rnet-window image { opacity: 1; }
  .rnet-title { margin: 0; }
+ .rnet-window spinner { color: @theme_fg_color; }
+ .rnet-hbtn { min-height: 20px; min-width: 24px; padding: 2px 4px; margin: 0; }
+ .rnet-hbtn > image { -gtk-icon-size: 16px; }
  .rnet-section-row { background-color: transparent; }
  .rnet-section-row:hover, .rnet-section-row:active, .rnet-section-row:selected { background-color: transparent; }
  .rnet-row { min-height: 48px; margin: 1px 0; border-radius: 6px; background-color: @theme_bg_color; background-image: none; }
@@ -212,7 +215,9 @@ pub fn run(
         let hidden_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let hotspot_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let hotspot_expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let hotspot_was: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let hotspot_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let hotspot_card: Rc<RefCell<Option<(gtk4::Revealer, gtk4::ListBoxRow)>>> =
+            Rc::new(RefCell::new(None));
         let hotspot_ssid: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let hotspot_psk: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let speeds: Rc<RefCell<(Option<u64>, Option<u64>)>> = Rc::new(RefCell::new((None, None)));
@@ -236,6 +241,7 @@ pub fn run(
         let strength_setters: Rc<RefCell<HashMap<String, theme::StrengthSetter>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let hide_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let pending_height: Rc<Cell<i32>> = Rc::new(Cell::new(0));
         let pending_rebuild = Rc::new(Cell::new(false));
 
         let window = gtk4::ApplicationWindow::new(app);
@@ -489,7 +495,23 @@ pub fn run(
                 let (_, max_h, min_list) = scale_limits(scale.get());
                 let ch = chrome.get();
                 let want = (base.get().max(min_list) + ch + reserved).clamp(min_list + ch, max_h);
+                tracing::debug!(want, base = base.get(), reserved, "grow popup");
                 if want != size.to.get() {
+                    size.run(want);
+                }
+            })
+        };
+
+        let grow_by: Rc<dyn Fn(i32)> = {
+            let scale = popup_scale.clone();
+            let chrome = chrome.clone();
+            let size = size.clone();
+            Rc::new(move |delta: i32| {
+                let (_, max_h, min_list) = scale_limits(scale.get());
+                let want =
+                    (size.to.get().saturating_add(delta)).clamp(min_list + chrome.get(), max_h);
+                if want != size.to.get() {
+                    tracing::debug!(want, delta, "grow_by popup");
                     size.run(want);
                 }
             })
@@ -499,6 +521,8 @@ pub fn run(
             let card = vbox.clone();
             let expanded2 = expanded.clone();
             let base2 = base_list_h.clone();
+            let hidden_open = hidden_expanded.clone();
+            let hotspot_open = hotspot_expanded.clone();
             let sc = scroll.clone();
             let scale = popup_scale.clone();
             let busy = anim_until.clone();
@@ -520,6 +544,7 @@ pub fn run(
                 let (card2, sc2) = (card.clone(), sc.clone());
                 let (dirty2, queued2, last2) = (dirty.clone(), queued.clone(), last.clone());
                 let (expanded3, base3) = (expanded2.clone(), base2.clone());
+                let (hidden_open2, hotspot_open2) = (hidden_open.clone(), hotspot_open.clone());
                 let (scale2, busy2, chrome2) = (scale.get(), busy.clone(), chrome.get());
                 let size2 = size.clone();
                 gtk4::glib::idle_add_local_once(move || {
@@ -533,19 +558,24 @@ pub fn run(
                                 return;
                             }
 
-                            if expanded3.borrow().is_some() || motion::now_ms() < busy2.get() {
+                            if motion::now_ms() < busy2.get() {
                                 return;
                             }
                             dirty2.set(false);
                             let (_, measured, list_h) =
                                 measure_popup(&card2, &sc2, scale2, chrome2);
+                            if expanded3.borrow().is_none()
+                                && !hidden_open2.get()
+                                && !hotspot_open2.get()
+                            {
+                                base3.set(list_h);
+                            }
                             let (_, max_h, min_list) = scale_limits(scale2);
                             let want = measured.clamp(min_list + chrome2, max_h);
                             let diff = want - size2.to.get();
                             if diff.abs() < MIN_HEIGHT_JITTER {
                                 return;
                             }
-                            base3.set(list_h);
                             size2.run(want);
                             last2.set(motion::now_ms());
                             tracing::debug!(diff, want, base = list_h, "popup refitted to rows");
@@ -557,6 +587,7 @@ pub fn run(
         let h = UiHandles {
             fit,
             grow,
+            grow_by,
             extra_heights: extra_heights.clone(),
             anim_until,
             scroll: scroll.clone(),
@@ -578,7 +609,8 @@ pub fn run(
             hidden_error: hidden_error.clone(),
             hotspot_error: hotspot_error.clone(),
             hotspot_expanded: hotspot_expanded.clone(),
-            hotspot_was: hotspot_was.clone(),
+            hotspot_closing: hotspot_closing.clone(),
+            hotspot_card: hotspot_card.clone(),
             hotspot_ssid: hotspot_ssid.clone(),
             hotspot_psk: hotspot_psk.clone(),
             speeds: speeds.clone(),
@@ -612,6 +644,21 @@ pub fn run(
 
         {
             let visible = visible.clone();
+            let pending = pending_height.clone();
+            let size_m = size.clone();
+            popup_revealer.connect_map(move |rev| {
+                if visible.get() {
+                    rev.set_reveal_child(true);
+                }
+                let target = pending.take();
+                if target > 0 {
+                    size_m.run(target);
+                }
+            });
+        }
+
+        {
+            let visible = visible.clone();
             let flag = popup_visible.clone();
             let window_c = window.clone();
             let revealer_c = popup_revealer.clone();
@@ -622,6 +669,7 @@ pub fn run(
                 if visible.get() {
                     flag.store(false, Ordering::Relaxed);
                     hide_popup(&window_c, &revealer_c, &size_c, &visible, &hide_gen_c);
+                    (h_c.grow_by)(i32::MIN);
                     list::schedule_teardown(&h_c);
                 }
                 gtk4::glib::Propagation::Stop
@@ -641,6 +689,7 @@ pub fn run(
                 if visible_b.get() {
                     flag_b.store(false, Ordering::Relaxed);
                     hide_popup(&window_b, &revealer_b, &size_b, &visible_b, &hide_gen_b);
+                    (h_b.grow_by)(i32::MIN);
                     list::schedule_teardown(&h_b);
                 }
             });
@@ -687,11 +736,11 @@ pub fn run(
                     }
                 }
                 let next = !h.hotspot_expanded.get();
-                h.hotspot_expanded.set(next);
-                if !next {
-                    h.hotspot_error.borrow_mut().take();
+                if next {
+                    hotspot::expand_hotspot(&h);
+                } else {
+                    hotspot::collapse_hotspot(&h);
                 }
-                refresh_list(&h);
             });
         }
 
@@ -754,7 +803,6 @@ pub fn run(
             });
         }
 
-        refresh_list(&h);
         window.set_visible(false);
 
         {
@@ -804,6 +852,7 @@ pub fn run(
                 if key == Key::Escape {
                     flag_e.store(false, Ordering::Relaxed);
                     hide_popup(&window_e, &revealer_e, &size_e, &visible_e, &hide_gen_e);
+                    (h_e.grow_by)(i32::MIN);
                     list::schedule_teardown(&h_e);
                     gtk4::glib::Propagation::Stop
                 } else {
@@ -981,6 +1030,7 @@ pub fn run(
                     if visible.get() {
                         flag.store(false, Ordering::Relaxed);
                         hide_popup(&window, &popup_revealer, &size, &visible, &hide_gen);
+                        (h_open.grow_by)(i32::MIN);
                         list::schedule_teardown(&h_open);
                         continue;
                     }
@@ -1014,10 +1064,12 @@ pub fn run(
                     tracing::debug!(entry, scale, "opening popup");
                     popup_scale.set(scale);
                     refresh_list(&h_open);
-                    let (w, final_h, _) = measure_popup(&vbox_open, &scroll, scale, chrome.get());
+                    let (w, final_h, list_h) =
+                        measure_popup(&vbox_open, &scroll, scale, chrome.get());
                     applied_w.set(w);
                     applied_h.set(final_h);
-                    size.snap(final_h);
+                    base_list_h.set(list_h);
+                    pending_height.set(final_h);
                     if let Some((x, y)) = pos {
                         place_near(&popup_revealer, x, y, w, final_h);
                     }
@@ -1026,25 +1078,19 @@ pub fn run(
                     h_open.anim_until.set(0);
                     (h_open.fit)();
 
-                    window.set_visible(true);
-                    window.present();
-
-                    let _ = tx_open.try_send(BackendCmd::Rescan);
-
                     hide_gen.set(hide_gen.get() + 1);
                     popup_revealer.set_reveal_child(false);
-                    {
-                        let v = visible.clone();
-                        let pop = popup_revealer.clone();
-                        gtk4::glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(8),
-                            move || {
-                                if v.get() {
-                                    pop.set_reveal_child(true);
-                                }
-                            },
-                        );
+                    window.set_visible(true);
+                    window.present();
+                    if popup_revealer.is_mapped() {
+                        let target = pending_height.take();
+                        if target > 0 {
+                            size.run(target);
+                        }
+                        popup_revealer.set_reveal_child(true);
                     }
+
+                    let _ = tx_open.try_send(BackendCmd::Rescan);
                 }
             });
         }

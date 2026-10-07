@@ -120,6 +120,14 @@ pub(crate) fn ensure_hidden_card(h: &UiHandles) -> (gtk4::Revealer, gtk4::ListBo
     rev.set_transition_duration(crate::ui::motion::REVEAL_MS);
     rev.set_reveal_child(false);
     rev.set_child(Some(&holder));
+    {
+        let expanded = h.hidden_expanded.clone();
+        rev.connect_map(move |r| {
+            if expanded.get() {
+                r.set_reveal_child(true);
+            }
+        });
+    }
     let wrap = gtk4::ListBoxRow::new();
     wrap.set_activatable(false);
     wrap.set_selectable(false);
@@ -130,31 +138,84 @@ pub(crate) fn ensure_hidden_card(h: &UiHandles) -> (gtk4::Revealer, gtk4::ListBo
 }
 
 pub(crate) fn expand_hidden(h: &UiHandles) {
+    if h.expanded.borrow().is_some() {
+        super::row::set_expanded(h, None);
+    }
+    if h.hotspot_expanded.get() {
+        super::hotspot::collapse_hotspot(h);
+    }
     h.hidden_closing.set(false);
     h.hidden_expanded.set(true);
     h.hidden_error.borrow_mut().take();
-    let (rev, _) = ensure_hidden_card(h);
-    gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(8), move || {
+    let (rev, row) = ensure_hidden_card(h);
+    h.anim_until
+        .set(gtk4::glib::monotonic_time() / 1000 + crate::ui::motion::REVEAL_MS as i64);
+    if row.parent().is_none() {
+        refresh_list(h);
+    }
+    let extra = rev
+        .child()
+        .filter(|_| h.scroll.width() > 0)
+        .map(|c| {
+            c.measure(gtk4::Orientation::Vertical, h.scroll.width())
+                .1
+                .max(0)
+        })
+        .unwrap_or(0);
+    if extra > 0 {
+        (h.grow)(extra);
+    }
+    if rev.is_mapped() {
         rev.set_reveal_child(true);
-    });
-    refresh_list(h);
+    }
+    let h2 = h.clone();
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(crate::ui::motion::REVEAL_MS as u64 + 40),
+        move || {
+            (h2.fit)();
+        },
+    );
 }
 
 pub(crate) fn collapse_hidden(h: &UiHandles) {
     h.hidden_expanded.set(false);
     h.hidden_error.borrow_mut().take();
-    if h.hidden_card.borrow().is_some() {
-        h.hidden_closing.set(true);
-        if let Some((rev, _)) = h.hidden_card.borrow().as_ref() {
-            rev.set_reveal_child(false);
-        }
-        let h2 = h.clone();
-        let closing = h.hidden_closing.clone();
-        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(160), move || {
+    let card = h.hidden_card.borrow().clone();
+    let Some((rev, _)) = card else {
+        refresh_list(h);
+        return;
+    };
+    h.hidden_closing.set(true);
+    let card_h = rev
+        .child()
+        .filter(|_| h.scroll.width() > 0)
+        .map(|c| {
+            c.measure(gtk4::Orientation::Vertical, h.scroll.width())
+                .1
+                .max(0)
+        })
+        .unwrap_or(0);
+    h.anim_until
+        .set(gtk4::glib::monotonic_time() / 1000 + crate::ui::motion::REVEAL_MS as i64);
+    (h.grow)(0);
+    tracing::debug!(
+        reveals = rev.reveals_child(),
+        shown = rev.is_child_revealed(),
+        mapped = rev.is_mapped(),
+        card_h,
+        "collapsing hidden card"
+    );
+    rev.set_reveal_child(false);
+    let h2 = h.clone();
+    let closing = h.hidden_closing.clone();
+    gtk4::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(
+            (crate::ui::motion::REVEAL_MS + crate::ui::motion::CLOSE_DELAY_MS + 20) as u64,
+        ),
+        move || {
             closing.set(false);
             refresh_list(&h2);
-        });
-    } else {
-        refresh_list(h);
-    }
+            (h2.fit)();
+        },
+    );
 }

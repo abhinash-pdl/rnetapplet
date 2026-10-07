@@ -38,6 +38,7 @@ pub struct WiredInfo {
 pub struct Model {
     pub aps: Arc<[Ap]>,
     pub active_ssid: Option<String>,
+    pub activating_ssid: Option<String>,
     pub active_iface: Option<String>,
     pub active_ipv4: Option<String>,
     pub active_bitrate_kbps: Option<u32>,
@@ -50,6 +51,8 @@ pub struct Model {
     pub wifi_enabled: bool,
     pub networking_enabled: bool,
     pub nm_online: bool,
+    pub no_internet: bool,
+    pub primary_wired: bool,
     pub vpn_connections: Arc<[VpnConnection]>,
 }
 impl Model {
