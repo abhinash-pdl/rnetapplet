@@ -90,8 +90,6 @@ jobs:
           cd .readme-bump
           git checkout main
           python3 - "$VER" "$SHA" <<'EOF'
-          SHA=$(cut -d' ' -f1 "rnetapplet-$VER-x86_64-linux.tar.gz.sha256")
-          python3 - "$VER" "$SHA" <<'EOF'
           import re, sys
           ver, sha = sys.argv[1], sys.argv[2]
           s = open("README.md").read()
