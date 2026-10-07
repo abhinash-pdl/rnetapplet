@@ -99,7 +99,7 @@ install it:
 ```sh
 curl -L -o rnetapplet.tar.gz \
   https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.4/rnetapplet-0.1.4-x86_64-linux.tar.gz
-echo "5fa9ac03cbf28dd41a63c4321b0c904b3c643176f63f90a84264f59b3fef66e7  rnetapplet.tar.gz" | sha256sum -c -
+echo "c580306f5ca23ebf284e53280fe6ae2d4eca2b7c92ac2f9fe51678a2a5c34296  rnetapplet.tar.gz" | sha256sum -c -
 tar xzf rnetapplet.tar.gz
 cd rnetapplet-0.1.4-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
