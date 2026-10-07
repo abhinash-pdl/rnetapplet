@@ -78,6 +78,9 @@ jobs:
       - name: point install script at the new release
         if: steps.ver.outputs.bump == 'true'
         run: |
+          cd "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git rev-parse --is-inside-work-tree
           VER="${{ steps.ver.outputs.version }}"
           SHA=$(cut -d' ' -f1 "rnetapplet-$VER-x86_64-linux.tar.gz.sha256")
           python3 - "$VER" "$SHA" <<'EOF'

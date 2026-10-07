@@ -98,10 +98,10 @@ install it:
 
 ```sh
 curl -L -o rnetapplet.tar.gz \
-  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.3/rnetapplet-0.1.3-x86_64-linux.tar.gz
-echo "30b5ad953568fd34af1fe99efe22c3e4b446db0c7272a59c46976ef5f3b50d95  rnetapplet.tar.gz" | sha256sum -c -
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.4/rnetapplet-0.1.4-x86_64-linux.tar.gz
+echo "ee97d89a76d8804202115b625868fd2254e90c347f77a0782366d94680621108  rnetapplet.tar.gz" | sha256sum -c -
 tar xzf rnetapplet.tar.gz
-cd rnetapplet-0.1.3-x86_64-linux
+cd rnetapplet-0.1.4-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
