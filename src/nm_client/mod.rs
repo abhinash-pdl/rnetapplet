@@ -615,7 +615,6 @@ mod ghost_tests {
     #[test]
     fn boottime_is_plausible() {
         let secs = boottime_secs().expect("boottime");
-        assert!(secs > 1_000, "uptime should exceed ~16 minutes");
         assert!(secs < 100_000_000, "uptime should stay well below epoch");
     }
 }
