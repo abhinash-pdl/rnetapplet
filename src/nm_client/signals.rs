@@ -1,10 +1,10 @@
 use super::NmClient;
 use crate::state::{Model, ModelTx};
-use futures::StreamExt as _;
+use futures_core::Stream as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 const MIN_REFRESH_GAP: Duration = Duration::from_millis(1500);
 const MIN_REFRESH_GAP_VISIBLE: Duration = Duration::from_millis(50);
@@ -24,23 +24,44 @@ pub enum Cmd {
     Membership,
     Scan,
 }
-impl Cmd {
-    fn merge(self, other: Cmd) -> Cmd {
-        use Cmd::*;
-        match (self, other) {
-            (Scan, _) | (_, Scan) => Scan,
-            (Membership, _) | (_, Membership) => Membership,
-            _ => Refresh,
+const REFRESH_BIT: u8 = 1;
+const MEMBERSHIP_BIT: u8 = 2;
+const SCAN_BIT: u8 = 4;
+struct Pending {
+    bits: AtomicU8,
+    wake: Notify,
+}
+impl Pending {
+    fn new() -> Self {
+        Self {
+            bits: AtomicU8::new(0),
+            wake: Notify::new(),
         }
     }
-    fn is_satisfied_by(self, pending: Cmd) -> bool {
-        pending == Cmd::Scan
-            || pending == self
-            || (self == Cmd::Refresh && pending == Cmd::Membership)
+    fn request(&self, cmd: Cmd) {
+        let bit = match cmd {
+            Cmd::Refresh => REFRESH_BIT,
+            Cmd::Membership => MEMBERSHIP_BIT,
+            Cmd::Scan => SCAN_BIT,
+        };
+        self.bits.fetch_or(bit, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+    fn has(&self, bit: u8) -> bool {
+        self.bits.load(Ordering::Relaxed) & bit != 0
+    }
+    fn take(&self) -> Option<Cmd> {
+        match self.bits.swap(0, Ordering::Relaxed) {
+            0 => None,
+            b if b & SCAN_BIT != 0 => Some(Cmd::Scan),
+            b if b & MEMBERSHIP_BIT != 0 => Some(Cmd::Membership),
+            _ => Some(Cmd::Refresh),
+        }
     }
 }
 pub struct Refresher {
-    tx: watch::Sender<Cmd>,
+    pending: Arc<Pending>,
+    out: ModelTx,
     task: tokio::task::JoinHandle<()>,
 }
 impl Refresher {
@@ -50,33 +71,24 @@ impl Refresher {
         visible: Arc<std::sync::atomic::AtomicBool>,
         frozen: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        let (tx, rx) = watch::channel(Cmd::Refresh);
+        let pending = Arc::new(Pending::new());
         let task = tokio::spawn(refresh_loop(
             client.clone(),
-            out,
-            rx,
+            out.clone(),
             visible,
             frozen,
-            tx.clone(),
+            pending.clone(),
         ));
-        Self { tx, task }
+        Self { pending, out, task }
     }
     pub fn request(&self, cmd: Cmd) {
-        let merged = self.tx.borrow().merge(cmd);
-        self.tx.send_replace(merged);
+        self.pending.request(cmd);
     }
-    pub async fn request_and_wait(&self, cmd: Cmd, timeout: Duration) -> bool {
-        self.request(cmd);
-        tokio::time::timeout(timeout, async {
-            loop {
-                if cmd.is_satisfied_by(*self.tx.borrow()) {
-                    return true;
-                }
-                tokio::time::sleep(MIN_REFRESH_GAP).await;
-            }
-        })
-        .await
-        .unwrap_or(false)
+    pub fn publish_with(&self, f: impl FnOnce(&mut Model)) -> bool {
+        let mut m = self.out.borrow().as_ref().clone();
+        f(&mut m);
+        self.out.send_replace(Arc::new(m));
+        true
     }
     pub fn stop(&self) {
         self.task.abort();
@@ -85,17 +97,15 @@ impl Refresher {
 async fn refresh_loop(
     client: Arc<NmClient>,
     out: ModelTx,
-    mut rx: watch::Receiver<Cmd>,
     visible: Arc<std::sync::atomic::AtomicBool>,
     frozen: Arc<std::sync::atomic::AtomicBool>,
-    cmd_tx: watch::Sender<Cmd>,
+    pending: Arc<Pending>,
 ) {
     let _budget = tokio::time::timeout(CRAWL_BUDGET, crawl_then_confirm(&client, &out)).await;
     let mut last = tokio::time::Instant::now();
     let mut last_scan_req = tokio::time::Instant::now()
         .checked_sub(SCAN_MIN_INTERVAL * 2)
         .unwrap_or_else(tokio::time::Instant::now);
-    let scan_running = Arc::new(AtomicBool::new(false));
     loop {
         let is_visible = visible.load(Ordering::Relaxed);
         let period = if is_visible {
@@ -105,40 +115,38 @@ async fn refresh_loop(
         };
         tokio::select! {
             _ = tokio::time::sleep(period) => {
-                if frozen.load(Ordering::Relaxed) {
-                    tracing::debug!("periodic tick frozen");
-                    continue;
-                }
-
+                let scan_frozen = frozen.load(Ordering::Relaxed);
                 paint(&client, &out, "periodic model refresh").await;
-                if is_visible {
-                    kick_scan(&client, &cmd_tx, &scan_running, &mut last_scan_req);
+                let hotspot_up = out
+                    .borrow()
+                    .hotspot
+                    .as_ref()
+                    .is_some_and(|hs| hs.active);
+                if !scan_frozen && !hotspot_up {
+                    kick_scan(&client, &pending, &mut last_scan_req).await;
+                } else {
+                    tracing::debug!("periodic scan skipped");
                 }
                 last = tokio::time::Instant::now();
             }
-            changed = rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
+            _ = pending.wake.notified() => {
                 let is_visible = visible.load(Ordering::Relaxed);
-                let mut pending = *rx.borrow_and_update();
-
-                let debounce = if pending == Cmd::Membership && is_visible {
-                    DEBOUNCE_FAST
-                } else {
-                    DEBOUNCE
-                };
-                while let Ok(Ok(())) =
-                    tokio::time::timeout(debounce, rx.changed()).await
+                let fast = pending.has(MEMBERSHIP_BIT) && is_visible;
+                let debounce = if fast { DEBOUNCE_FAST } else { DEBOUNCE };
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                while tokio::time::Instant::now() < deadline
+                    && tokio::time::timeout(debounce, pending.wake.notified())
+                        .await
+                        .is_ok()
                 {
-                    pending = (*rx.borrow_and_update()).merge(pending);
                 }
-                let scan = pending == Cmd::Scan;
-                let fast = pending == Cmd::Membership && is_visible;
-                tracing::debug!(scan, "refresh firing");
-                if frozen.load(Ordering::Relaxed) {
+                let Some(cmd) = pending.take() else {
                     continue;
-                }
+                };
+                let scan = cmd == Cmd::Scan;
+                let fast = cmd == Cmd::Membership && is_visible;
+                tracing::debug!(scan, "refresh firing");
+                let scan_frozen = frozen.load(Ordering::Relaxed);
                 if !fast {
                     let gap = if is_visible {
                         MIN_REFRESH_GAP_VISIBLE
@@ -149,13 +157,15 @@ async fn refresh_loop(
                     if !gap.is_zero() {
                         tokio::time::sleep(gap).await;
                     }
-                    if frozen.load(Ordering::Relaxed) {
-                        continue;
-                    }
                 }
                 paint(&client, &out, "model refresh").await;
-                if scan && !frozen.load(Ordering::Relaxed) {
-                    kick_scan(&client, &cmd_tx, &scan_running, &mut last_scan_req);
+                let hotspot_up = out
+                    .borrow()
+                    .hotspot
+                    .as_ref()
+                    .is_some_and(|hs| hs.active);
+                if scan && !scan_frozen && !hotspot_up {
+                    kick_scan(&client, &pending, &mut last_scan_req).await;
                 }
                 last = tokio::time::Instant::now();
             }
@@ -163,33 +173,32 @@ async fn refresh_loop(
     }
 }
 
-fn kick_scan(
+async fn kick_scan(
     client: &Arc<NmClient>,
-    tx: &watch::Sender<Cmd>,
-    running: &Arc<AtomicBool>,
+    pending: &Arc<Pending>,
     last_req: &mut tokio::time::Instant,
 ) {
     if last_req.elapsed() < SCAN_MIN_INTERVAL {
         tracing::debug!("scan skipped (NM 10s rate limit)");
         return;
     }
-    if running.swap(true, Ordering::SeqCst) {
-        tracing::debug!("scan skipped (one already in flight)");
+    let done = tokio::time::timeout(
+        super::SCAN_WAIT + Duration::from_secs(10),
+        scan_once(client),
+    )
+    .await;
+    if matches!(done, Ok(())) {
+        *last_req = tokio::time::Instant::now();
+    }
+    if done.is_err() {
+        warn!("scan exceeded its window");
         return;
     }
-    *last_req = tokio::time::Instant::now();
-    let client = client.clone();
-    let tx = tx.clone();
-    let running = running.clone();
-    tokio::spawn(async move {
-        scan_once(&client).await;
-        running.store(false, Ordering::SeqCst);
-        tx.send_modify(|cmd| *cmd = cmd.merge(Cmd::Membership));
-    });
+    pending.request(Cmd::Membership);
 }
 
 async fn paint(client: &NmClient, out: &ModelTx, what: &str) {
-    if tokio::time::timeout(CRAWL_BUDGET, crawl_then_confirm(client, out))
+    if tokio::time::timeout(CRAWL_BUDGET, crawl(client, out))
         .await
         .is_err()
     {
@@ -212,6 +221,10 @@ async fn crawl(client: &NmClient, out: &ModelTx) {
         Ok(model) => {
             if !keep_over(&out.borrow(), &model) {
                 tracing::debug!("dropping empty crawl over populated list");
+                return;
+            }
+            if **out.borrow() == model {
+                tracing::debug!("model unchanged; skipping publish");
                 return;
             }
             let aps = model.aps.len();
@@ -272,46 +285,73 @@ async fn scan_once(client: &NmClient) {
         Err(e) => warn!("scan skipped: {e:#}"),
     }
 }
+type SignalRule = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    Cmd,
+);
 pub fn spawn_signal_watcher(
     client: Arc<NmClient>,
-    refresher: Arc<Refresher>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        use zbus::{MatchRule, MessageStream, message::Type};
-        let rules: Vec<(&str, &str, Option<&str>, Option<&str>)> = vec![
-            (
-                "org.freedesktop.DBus.Properties",
-                "PropertiesChanged",
-                Some("/"),
-                None,
-            ),
-            (
-                "org.freedesktop.NetworkManager.Device.Wireless",
-                "AccessPointAdded",
-                None,
-                Some("/org/freedesktop/NetworkManager/Devices"),
-            ),
-            (
-                "org.freedesktop.NetworkManager.Device.Wireless",
-                "AccessPointRemoved",
-                None,
-                Some("/org/freedesktop/NetworkManager/Devices"),
-            ),
-        ];
-        for (iface, member, arg0, ns) in rules {
-            let cmd = if member.starts_with("AccessPoint") {
-                Cmd::Membership
-            } else {
-                Cmd::Refresh
-            };
+    refresher: std::sync::Weak<Refresher>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    use zbus::{MatchRule, MessageStream, message::Type};
+    let rules: Vec<SignalRule> = vec![
+        (
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            Some("org.freedesktop.NetworkManager"),
+            Some("/org/freedesktop/NetworkManager"),
+            Cmd::Refresh,
+        ),
+        (
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            Some("org.freedesktop.NetworkManager.Device"),
+            Some("/org/freedesktop/NetworkManager"),
+            Cmd::Refresh,
+        ),
+        (
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            Some("org.freedesktop.NetworkManager.Device.Wireless"),
+            Some("/org/freedesktop/NetworkManager"),
+            Cmd::Refresh,
+        ),
+        (
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            Some("org.freedesktop.NetworkManager.Connection.Active"),
+            Some("/org/freedesktop/NetworkManager"),
+            Cmd::Refresh,
+        ),
+        (
+            "org.freedesktop.NetworkManager.Device.Wireless",
+            "AccessPointAdded",
+            None,
+            Some("/org/freedesktop/NetworkManager/Devices"),
+            Cmd::Membership,
+        ),
+        (
+            "org.freedesktop.NetworkManager.Device.Wireless",
+            "AccessPointRemoved",
+            None,
+            Some("/org/freedesktop/NetworkManager/Devices"),
+            Cmd::Membership,
+        ),
+    ];
+    rules
+        .into_iter()
+        .map(|(iface, member, arg0, ns, cmd)| {
             let conn = client.system_conn().clone();
             let refresher = refresher.clone();
             tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(500);
                 loop {
-                    if refresher_tx_closed(&refresher) {
+                    let Some(live) = refresher.upgrade() else {
                         break;
-                    }
+                    };
                     let rule = (|| -> anyhow::Result<MatchRule<'static>> {
                         let b = MatchRule::builder().msg_type(Type::Signal);
                         let b = b.interface(iface)?;
@@ -331,9 +371,7 @@ pub fn spawn_signal_watcher(
                             return;
                         }
                     };
-                    let mut stream = match MessageStream::for_match_rule(rule, &conn, Some(64))
-                        .await
-                    {
+                    let stream = match MessageStream::for_match_rule(rule, &conn, Some(64)).await {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(
@@ -346,69 +384,58 @@ pub fn spawn_signal_watcher(
                     };
                     backoff = Duration::from_millis(500);
                     let mut n = 0u32;
-                    while stream.next().await.is_some() {
+                    tokio::pin!(stream);
+                    while std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+                        .await
+                        .is_some()
+                    {
                         n += 1;
                         tracing::debug!(n, signal = member, "ap signal");
-                        refresher.request(cmd);
+                        live.request(cmd);
                     }
                     warn!("signal stream ended ({iface}.{member}), resubscribing");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
-            });
-        }
-    })
-}
-fn refresher_tx_closed(r: &Arc<Refresher>) -> bool {
-    r.tx.is_closed()
+            })
+        })
+        .collect()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn refresh_never_downgrades_a_pending_scan() {
-        let mut pending = Cmd::Refresh;
-        for c in [Cmd::Refresh, Cmd::Refresh, Cmd::Scan, Cmd::Refresh] {
-            pending = pending.merge(c);
-        }
-        assert_eq!(pending, Cmd::Scan);
+    fn take_prefers_scan_over_everything() {
+        let pending = Pending::new();
+        pending.request(Cmd::Refresh);
+        pending.request(Cmd::Membership);
+        pending.request(Cmd::Scan);
+        pending.request(Cmd::Refresh);
+        assert_eq!(pending.take(), Some(Cmd::Scan));
     }
 
     #[test]
-    fn a_scan_upgrades_a_pending_refresh() {
-        assert_eq!(Cmd::Refresh.merge(Cmd::Scan), Cmd::Scan);
+    fn take_prefers_membership_over_refresh() {
+        let pending = Pending::new();
+        pending.request(Cmd::Refresh);
+        pending.request(Cmd::Membership);
+        assert_eq!(pending.take(), Some(Cmd::Membership));
     }
 
     #[test]
-    fn a_scan_keeps_a_pending_scan() {
-        assert_eq!(Cmd::Scan.merge(Cmd::Scan), Cmd::Scan);
-        assert_eq!(Cmd::Scan.merge(Cmd::Refresh), Cmd::Scan);
+    fn take_consumes_the_request() {
+        let pending = Pending::new();
+        assert_eq!(pending.take(), None);
+        pending.request(Cmd::Scan);
+        assert_eq!(pending.take(), Some(Cmd::Scan));
+        assert_eq!(pending.take(), None);
     }
 
     #[test]
-    fn refreshes_stay_refreshes() {
-        assert_eq!(Cmd::Refresh.merge(Cmd::Refresh), Cmd::Refresh);
-    }
-
-    #[test]
-    fn a_pending_scan_satisfies_a_refresh_request() {
-        assert!(Cmd::Refresh.is_satisfied_by(Cmd::Scan));
-        assert!(Cmd::Scan.is_satisfied_by(Cmd::Scan));
-        assert!(!Cmd::Scan.is_satisfied_by(Cmd::Refresh));
-    }
-
-    #[test]
-    fn membership_beats_plain_refresh_but_loses_to_scan() {
-        assert_eq!(Cmd::Refresh.merge(Cmd::Membership), Cmd::Membership);
-        assert_eq!(Cmd::Membership.merge(Cmd::Refresh), Cmd::Membership);
-        assert_eq!(Cmd::Membership.merge(Cmd::Scan), Cmd::Scan);
-        assert_eq!(Cmd::Scan.merge(Cmd::Membership), Cmd::Scan);
-    }
-
-    #[test]
-    fn a_pending_membership_satisfies_a_refresh_request() {
-        assert!(Cmd::Refresh.is_satisfied_by(Cmd::Membership));
-        assert!(Cmd::Membership.is_satisfied_by(Cmd::Membership));
-        assert!(!Cmd::Membership.is_satisfied_by(Cmd::Refresh));
-        assert!(!Cmd::Scan.is_satisfied_by(Cmd::Membership));
+    fn take_reports_plain_refresh() {
+        let pending = Pending::new();
+        pending.request(Cmd::Refresh);
+        assert_eq!(pending.take(), Some(Cmd::Refresh));
     }
 
     #[test]
@@ -419,17 +446,16 @@ mod tests {
     }
 
     fn ap_model(ssids: &[&str]) -> Model {
+        use crate::nm_client::aps::{Bands, Security};
         Model {
             aps: ssids
                 .iter()
                 .map(|s| crate::state::Ap {
-                    ssid: s.to_string(),
+                    ssid: (*s).into(),
                     strength: 70,
-                    secured: true,
-                    enterprise: false,
-                    wep: false,
+                    security: Security::Wpa,
                     freq_mhz: None,
-                    bands: 0,
+                    bands: Bands::NONE,
                     saved: false,
                     known: false,
                     priority: 0,

@@ -1,17 +1,31 @@
 pub use crate::state::BackendCmd as TrayEvent;
-use crate::state::{BackendCmd, Model, ModelRx};
+use crate::state::{BackendCmd, Model};
 use ksni::TrayMethods as _;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
 pub struct RnetTray {
     model: Arc<Model>,
     event_tx: async_channel::Sender<BackendCmd>,
+    toggle_tx: async_channel::Sender<Option<(i32, i32)>>,
 }
 impl RnetTray {
-    pub fn new(model: Arc<Model>, event_tx: async_channel::Sender<BackendCmd>) -> Self {
-        Self { model, event_tx }
+    pub fn new(
+        model: Arc<Model>,
+        event_tx: async_channel::Sender<BackendCmd>,
+        toggle_tx: async_channel::Sender<Option<(i32, i32)>>,
+    ) -> Self {
+        Self {
+            model,
+            event_tx,
+            toggle_tx,
+        }
     }
     fn emit(&self, ev: TrayEvent) {
         let _ = self.event_tx.try_send(ev);
+    }
+    fn toggle(&self, pos: Option<(i32, i32)>) {
+        let _ = self.toggle_tx.try_send(pos);
     }
 }
 pub fn icon_for(model: &Model) -> String {
@@ -120,7 +134,7 @@ impl ksni::Tray for RnetTray {
     }
     fn activate(&mut self, x: i32, y: i32) {
         tracing::debug!(x, y, "tray icon activated");
-        self.emit(BackendCmd::TogglePopup(Some((x, y))));
+        self.toggle(Some((x, y)));
     }
     fn menu(&self) -> Vec<ksni::menu::MenuItem<Self>> {
         use ksni::menu::*;
@@ -129,7 +143,7 @@ impl ksni::Tray for RnetTray {
             StandardItem {
                 label: "Open".into(),
                 icon_name: "network-wireless".into(),
-                activate: Box::new(|tray: &mut Self| tray.emit(BackendCmd::TogglePopup(None))),
+                activate: Box::new(|tray: &mut Self| tray.toggle(None)),
                 ..Default::default()
             }
             .into(),
@@ -154,49 +168,198 @@ impl ksni::Tray for RnetTray {
         ]
     }
 }
-pub async fn spawn(
-    initial: Arc<Model>,
-    event_tx: async_channel::Sender<BackendCmd>,
-) -> anyhow::Result<ksni::Handle<RnetTray>> {
-    let tray = RnetTray::new(initial, event_tx);
-    let handle = tray.spawn().await?;
-    Ok(handle)
+const TRAY_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const TRAY_RETRY_MAX: Duration = Duration::from_secs(30);
+const TRAY_UPDATE_TIMEOUT: Duration = Duration::from_secs(3);
+const TRAY_SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+const TRAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const TRAY_RESTART_PAUSE: Duration = Duration::from_secs(2);
+
+pub struct TrayService {
+    tx: mpsc::Sender<Arc<Model>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
-pub fn spawn_updater(
-    handle: ksni::Handle<RnetTray>,
-    mut rx: ModelRx,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if rx.changed().await.is_err() {
-                break;
+impl TrayService {
+    pub fn start(
+        initial: Arc<Model>,
+        event_tx: async_channel::Sender<BackendCmd>,
+        toggle_tx: async_channel::Sender<Option<(i32, i32)>>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel(1);
+        let _ = tx.try_send(initial);
+        let thread = std::thread::Builder::new()
+            .name("rnetapplet-tray".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("could not build tray runtime: {e:#}");
+                        return;
+                    }
+                };
+                loop {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(run_tray(&mut rx, &event_tx, &toggle_tx))
+                    }));
+                    match outcome {
+                        Ok(()) => return,
+                        Err(_) => {
+                            tracing::error!("tray task failed; restarting the tray integration");
+                            std::thread::sleep(TRAY_RESTART_PAUSE);
+                        }
+                    }
+                }
+            })
+            .map_err(|e| tracing::warn!("could not spawn tray thread: {e}"))
+            .ok();
+        Self { tx, thread }
+    }
+    pub fn clone_sender(&self) -> mpsc::Sender<Arc<Model>> {
+        self.tx.clone()
+    }
+    pub fn stop(mut self) {
+        drop(self.tx);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+async fn shutdown_handle(handle: ksni::Handle<RnetTray>) {
+    if tokio::time::timeout(TRAY_SHUTDOWN_TIMEOUT, handle.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!("tray shutdown stalled; abandoning the stale registration");
+    }
+}
+
+async fn backoff_once(
+    rx: &mut mpsc::Receiver<Arc<Model>>,
+    latest: &mut Option<Arc<Model>>,
+    backoff: &mut Duration,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(*backoff) => {}
+        m = rx.recv() => match m {
+            Some(m) => *latest = Some(m),
+            None => return false,
+        },
+    }
+    *backoff = (*backoff * 2).min(TRAY_RETRY_MAX);
+    true
+}
+
+async fn run_tray(
+    rx: &mut mpsc::Receiver<Arc<Model>>,
+    event_tx: &async_channel::Sender<BackendCmd>,
+    toggle_tx: &async_channel::Sender<Option<(i32, i32)>>,
+) {
+    let mut latest: Option<Arc<Model>> = None;
+    let mut backoff = TRAY_RETRY_INITIAL;
+    loop {
+        if latest.is_none() {
+            match rx.recv().await {
+                Some(m) => latest = Some(m),
+                None => return,
             }
-            let model = rx.borrow().clone();
-            if handle.update(|tray| tray.model = model).await.is_none() {
-                break;
+            continue;
+        }
+        let spawned = tokio::time::timeout(
+            TRAY_SPAWN_TIMEOUT,
+            spawn(
+                latest.as_ref().unwrap().clone(),
+                event_tx.clone(),
+                toggle_tx.clone(),
+            ),
+        )
+        .await;
+        let handle = match spawned {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(e)) => {
+                tracing::warn!("SNI tray host not available ({e:#}); retrying in {backoff:?}");
+                if !backoff_once(rx, &mut latest, &mut backoff).await {
+                    return;
+                }
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "tray registration timed out after {TRAY_SPAWN_TIMEOUT:?}; retrying"
+                );
+                if !backoff_once(rx, &mut latest, &mut backoff).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        tracing::info!("tray registered as org.kde.StatusNotifierItem (id=rnetapplet)");
+        backoff = TRAY_RETRY_INITIAL;
+        let mut healthy = true;
+        while healthy {
+            loop {
+                match rx.recv().await {
+                    None => {
+                        shutdown_handle(handle).await;
+                        return;
+                    }
+                    Some(m) => latest = Some(m),
+                }
+                if rx.try_recv().is_err() {
+                    break;
+                }
+            }
+            let model = latest.as_ref().unwrap().clone();
+            match tokio::time::timeout(
+                TRAY_UPDATE_TIMEOUT,
+                handle.update(|tray| tray.model = model),
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!("tray item detached from host; re-registering");
+                    healthy = false;
+                }
+                Err(_) => {
+                    tracing::warn!("tray update timed out; re-registering item");
+                    healthy = false;
+                }
             }
         }
-    })
+        shutdown_handle(handle).await;
+    }
+}
+
+async fn spawn(
+    initial: Arc<Model>,
+    event_tx: async_channel::Sender<BackendCmd>,
+    toggle_tx: async_channel::Sender<Option<(i32, i32)>>,
+) -> anyhow::Result<ksni::Handle<RnetTray>> {
+    let tray = RnetTray::new(initial, event_tx, toggle_tx);
+    Ok(tray.spawn().await?)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Ap, Model};
+    use crate::nm_client::aps::{Bands, Security};
+    use crate::state::{Ap, Model, Ssid};
     fn model_with(strength: u8, active: Option<&str>) -> Model {
         Model {
             aps: Arc::from(vec![Ap {
                 priority: 0,
                 ssid: "Home".into(),
                 strength,
-                secured: true,
-                enterprise: false,
-                wep: false,
+                security: Security::Wpa,
                 freq_mhz: None,
-                bands: 0,
+                bands: Bands::NONE,
                 known: false,
                 saved: true,
             }]),
-            active_ssid: active.map(str::to_string),
+            active_ssid: active.map(Ssid::from),
             ..Model::empty()
         }
     }

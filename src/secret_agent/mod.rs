@@ -1,4 +1,4 @@
-use crate::state::UiEvent;
+use crate::state::{Secret, UiEvent};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use zbus::zvariant::OwnedValue;
 pub const AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
 pub const AGENT_IDENTIFIER: &str = "dev.abhinash-pdl.rnetapplet";
 pub const FLAG_REQUEST_NEW: u32 = 0x2;
-pub const SECRET_TIMEOUT: Duration = Duration::from_secs(120);
+pub const SECRET_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_PROVIDED_PATHS: usize = 16;
 const MAX_PROVIDED_PER_PATH: usize = 4;
 const MAX_WAITERS: usize = 16;
@@ -21,6 +21,7 @@ struct Waiter {
 struct Inner {
     provided: HashMap<String, Vec<String>>,
     waiters: Vec<Waiter>,
+    served_psk: HashMap<String, Secret>,
 }
 #[derive(Default)]
 pub struct SecretStore {
@@ -65,10 +66,21 @@ impl SecretStore {
         if v.is_empty() {
             g.provided.remove(path);
         }
+        g.served_psk
+            .insert(path.to_string(), Secret::from(psk.as_str()));
         Some(psk)
     }
 
+    pub async fn take_served_psk(&self, path: &str) -> Option<Secret> {
+        self.inner.lock().await.served_psk.remove(path)
+    }
+
+    pub async fn clear_served(&self, path: &str) {
+        self.inner.lock().await.served_psk.remove(path);
+    }
+
     pub async fn wait(&self, path: &str) -> Option<String> {
+        let key = path.to_string();
         let rx = {
             let mut g = self.inner.lock().await;
             if let Some(mut queued) = g.provided.remove(path)
@@ -77,6 +89,7 @@ impl SecretStore {
                 if !queued.is_empty() {
                     g.provided.insert(path.to_string(), queued);
                 }
+                g.served_psk.insert(key.clone(), Secret::from(psk.as_str()));
                 return Some(psk);
             }
             let (tx, rx) = oneshot::channel();
@@ -90,11 +103,22 @@ impl SecretStore {
             });
             rx
         };
-        rx.await.ok().flatten()
+        match rx.await.ok().flatten() {
+            Some(psk) => {
+                self.inner
+                    .lock()
+                    .await
+                    .served_psk
+                    .insert(key, Secret::from(psk.as_str()));
+                Some(psk)
+            }
+            None => None,
+        }
     }
     pub async fn forget_path(&self, path: &str) {
         let mut g = self.inner.lock().await;
         g.provided.remove(path);
+        g.served_psk.remove(path);
         g.waiters.retain(|w| w.path != path);
     }
 
@@ -204,7 +228,7 @@ impl SecretAgentImpl {
         if self
             .events
             .try_send(UiEvent::SecretsNeeded {
-                ssid: ssid.clone(),
+                ssid: ssid.clone().into(),
                 path: path.clone(),
                 request_new,
             })
@@ -332,6 +356,34 @@ mod tests {
         assert_eq!(s.try_take("/c/1").await, None);
     }
     #[tokio::test]
+    async fn take_reports_consumed_secret_value_once() {
+        let s = SecretStore::new();
+        assert!(s.take_served_psk("/c/1").await.is_none());
+        s.provide("/c/1", "pw1".into()).await;
+        assert!(s.take_served_psk("/c/1").await.is_none());
+        assert_eq!(s.try_take("/c/1").await.as_deref(), Some("pw1"));
+        assert_eq!(s.take_served_psk("/c/1").await.as_deref(), Some("pw1"));
+        assert!(s.take_served_psk("/c/1").await.is_none());
+    }
+    #[tokio::test]
+    async fn wait_success_marks_path_served() {
+        let s = SecretStore::new();
+        let s2 = s.clone();
+        let waiter = tokio::spawn(async move { s2.wait("/c/2").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        s.provide("/c/2", "pw2".into()).await;
+        assert_eq!(waiter.await.unwrap().as_deref(), Some("pw2"));
+        assert_eq!(s.take_served_psk("/c/2").await.as_deref(), Some("pw2"));
+    }
+    #[tokio::test]
+    async fn clear_served_drops_consumption_proof() {
+        let s = SecretStore::new();
+        s.provide("/c/3", "pw3".into()).await;
+        assert_eq!(s.try_take("/c/3").await.as_deref(), Some("pw3"));
+        s.clear_served("/c/3").await;
+        assert!(s.take_served_psk("/c/3").await.is_none());
+    }
+    #[tokio::test]
     async fn wait_then_provide_resolves() {
         let s = SecretStore::new();
         let s2 = s.clone();
@@ -348,5 +400,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         s.cancel_path("/c/9").await;
         assert_eq!(waiter.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn forget_path_resolves_a_live_waiter() {
+        let s = SecretStore::new();
+        let s2 = s.clone();
+        let waiter = tokio::spawn(async move { s2.wait("/c/7").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        s.forget_path("/c/7").await;
+        assert_eq!(
+            waiter.await.unwrap(),
+            None,
+            "forget must never leave NM blocked"
+        );
     }
 }

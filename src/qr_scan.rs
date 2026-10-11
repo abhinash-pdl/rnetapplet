@@ -1,7 +1,8 @@
 use crate::qr::{self, WifiQr};
 use crate::state::BackendCmd;
 use gtk4::prelude::*;
-use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
+use std::rc::Rc;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -11,7 +12,8 @@ use std::time::Duration;
 fn is_virtual_camera(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("virtual")
-        || n.contains("obs")
+        || n.contains("obs virtual")
+        || n.contains("v4l2loopback")
         || n.contains("loopback")
         || n.contains("droidcam")
         || n.contains("manycam")
@@ -41,7 +43,7 @@ struct SharedFrame {
     h: u32,
     rgb: Vec<u8>,
 }
-pub async fn file_scan_flow(cmd_tx: async_channel::Sender<BackendCmd>) {
+pub async fn file_scan_flow(on_code: Rc<dyn Fn(&WifiQr) -> bool>, window: gtk4::ApplicationWindow) {
     let dlg = gtk4::FileDialog::new();
     dlg.set_title("Open Wi-Fi QR code image");
     let filter = gtk4::FileFilter::new();
@@ -53,87 +55,25 @@ pub async fn file_scan_flow(cmd_tx: async_channel::Sender<BackendCmd>) {
         Err(_) => return,
     };
     let bytes = match file.load_bytes(gtk4::gio::Cancellable::NONE) {
-        Ok((b, _)) => b,
+        Ok((b, _)) => b.to_vec(),
         Err(e) => {
             tracing::warn!("QR image load failed: {e}");
             return;
         }
     };
-    match qr::decode_wifi_qr(&bytes) {
-        Ok(code) => {
+    match gtk4::gio::spawn_blocking(move || qr::decode_wifi_qr(&bytes)).await {
+        Ok(Ok(code)) => {
             tracing::info!(ssid = %code.ssid, "QR decoded from file");
-            match qr::route(&code) {
-                Some(cmd) => {
-                    let _ = cmd_tx.send(cmd).await;
-                }
-                None => tracing::warn!(ssid = %code.ssid, "unsupported QR security"),
+            if on_code(&code) {
+                window.close();
             }
         }
-        Err(e) => tracing::warn!("QR decode failed: {e:#}"),
+        Ok(Err(e)) => tracing::warn!("QR decode failed: {e:#}"),
+        Err(_) => tracing::warn!("QR decode task failed"),
     }
 }
-fn scan_gray(gray: &image::GrayImage) -> Option<WifiQr> {
-    let mut prepared = rqrr::PreparedImage::prepare(gray.clone());
-    for grid in prepared.detect_grids() {
-        if let Ok((_, content)) = grid.decode()
-            && content.starts_with("WIFI:")
-            && let Some(qr) = qr::parse_wifi_qr(&content)
-        {
-            return Some(qr);
-        }
-    }
-    None
-}
-fn stretch_lut(gray: &image::GrayImage) -> [u8; 256] {
-    let mut lo = 255u8;
-    let mut hi = 0u8;
-    for p in gray.pixels() {
-        let v = p[0];
-        if v < lo {
-            lo = v;
-        }
-        if v > hi {
-            hi = v;
-        }
-    }
-    let mut lut = [0u8; 256];
-    if hi <= lo {
-        return lut;
-    }
-    for (i, slot) in lut.iter_mut().enumerate() {
-        let v = i as u32;
-        let lo = lo as u32;
-        let hi = hi as u32;
-        *slot = (((v.saturating_sub(lo)) * 255) / (hi - lo).max(1)) as u8;
-    }
-    lut
-}
-fn apply_lut(gray: &image::GrayImage, lut: &[u8; 256]) -> image::GrayImage {
-    let mut out = gray.clone();
-    for p in out.pixels_mut() {
-        p[0] = lut[p[0] as usize];
-    }
-    out
-}
-fn decode_gray_variants(gray: &image::GrayImage) -> Option<WifiQr> {
-    let lut = stretch_lut(gray);
-    let stretched = apply_lut(gray, &lut);
-    if let Some(qr) = scan_gray(&stretched) {
-        return Some(qr);
-    }
-    let mut inv = stretched.clone();
-    image::imageops::invert(&mut inv);
-    if let Some(qr) = scan_gray(&inv) {
-        return Some(qr);
-    }
-    let mut thresh = stretched.clone();
-    for p in thresh.pixels_mut() {
-        p[0] = if p[0] < 128 { 0 } else { 255 };
-    }
-    if let Some(qr) = scan_gray(&thresh) {
-        return Some(qr);
-    }
-    scan_gray(gray)
+fn try_decode_rgb(rgb: &[u8], w: u32, h: u32) -> Option<WifiQr> {
+    crate::qr::decode_gray_variants(&work_gray_from_rgb(rgb, w, h)?)
 }
 const DECODE_HZ: u32 = 10;
 const PREVIEW_TICK: Duration = Duration::from_millis(50);
@@ -154,7 +94,7 @@ fn work_dims(w: u32, h: u32) -> (u32, u32) {
         th = WORK_MAX_H;
     }
     if tw < WORK_MIN_W {
-        let s = (640 / tw.max(1)).clamp(2, 3);
+        let s = (WORK_MAX_H / th.max(1)).min(640 / tw.max(1)).clamp(1, 3);
         tw *= s;
         th *= s;
     }
@@ -186,26 +126,41 @@ fn work_gray_from_rgb(rgb: &[u8], w: u32, h: u32) -> Option<image::GrayImage> {
                 for sy in sy0..sy1 {
                     for sx in sx0..sx1 {
                         let i = (sy * src_w + sx) * 3;
-                        sum += (rgb[i] as u32 * 299
-                            + rgb[i + 1] as u32 * 587
-                            + rgb[i + 2] as u32 * 114)
-                            / 1000;
+                        sum +=
+                            (rgb[i] as u32 * 77 + rgb[i + 1] as u32 * 150 + rgb[i + 2] as u32 * 29)
+                                >> 8;
                         n += 1;
                     }
                 }
                 (sum / n.max(1)) as u8
             } else {
                 let i = (sy0 * src_w + sx0) * 3;
-                ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000)
-                    as u8
+                ((rgb[i] as u32 * 77 + rgb[i + 1] as u32 * 150 + rgb[i + 2] as u32 * 29) >> 8) as u8
             };
             *px = luma;
         }
     }
     image::GrayImage::from_raw(tw, th, out)
 }
-fn try_decode_rgb(rgb: &[u8], w: u32, h: u32) -> Option<WifiQr> {
-    decode_gray_variants(&work_gray_from_rgb(rgb, w, h)?)
+fn mirror_rgb(rgb: &mut [u8], w: u32) {
+    let stride = w as usize * 3;
+    if stride == 0 {
+        return;
+    }
+    if !rgb.len().is_multiple_of(stride) {
+        return;
+    }
+    for row in rgb.chunks_exact_mut(stride) {
+        let mut lo = 0usize;
+        let mut hi = w as usize - 1;
+        while lo < hi {
+            row.swap(lo * 3, hi * 3);
+            row.swap(lo * 3 + 1, hi * 3 + 1);
+            row.swap(lo * 3 + 2, hi * 3 + 2);
+            lo += 1;
+            hi -= 1;
+        }
+    }
 }
 fn open_camera(
     index: nokhwa::utils::CameraIndex,
@@ -242,8 +197,6 @@ fn open_camera(
             )),
         ),
         ("default", RequestedFormatType::None),
-        ("high-res", RequestedFormatType::AbsoluteHighestResolution),
-        ("high-fps", RequestedFormatType::AbsoluteHighestFrameRate),
     ];
     let mut last_err = String::from("no formats attempted");
     for (label, kind) in attempts {
@@ -314,22 +267,33 @@ fn camera_loop(
     let mut decode_errors = 0u32;
     let mut last_work = std::time::Instant::now() - Duration::from_secs(1);
     let work_every = Duration::from_millis(1000 / DECODE_HZ as u64);
+    let mut frame_errors = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        let frame = match cam.frame() {
-            Ok(f) => f,
+        let raw_frame = match cam.frame() {
+            Ok(f) => {
+                frame_errors = 0;
+                f
+            }
             Err(_) => {
+                frame_errors += 1;
+                if frame_errors > 50 {
+                    say("Camera stopped responding".to_string());
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
         };
-        let mjpeg = (frame.source_frame_format() == nokhwa::utils::FrameFormat::MJPEG)
-            .then(|| frame.buffer().to_vec());
-        let img = match frame.decode_image::<RgbFormat>() {
+        let want_preview = frames.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let want_work = last_work.elapsed() >= work_every;
+        if !want_preview && !want_work {
+            continue;
+        }
+        let img = match raw_frame.decode_image::<RgbFormat>() {
             Ok(i) => i,
             Err(e) => {
-                let fallback = mjpeg
-                    .as_deref()
-                    .and_then(|b| image::load_from_memory(b).ok())
+                let fallback = image::load_from_memory(raw_frame.buffer())
+                    .ok()
                     .map(|i| i.to_rgb8());
                 match fallback {
                     Some(decoded) => decoded,
@@ -350,14 +314,19 @@ fn camera_loop(
             continue;
         }
 
-        if last_work.elapsed() >= work_every {
+        if want_work {
             last_work = std::time::Instant::now();
             if let Some(g) = work_gray_from_rgb(&rgb, w, h) {
                 *work.lock().unwrap_or_else(|e| e.into_inner()) = Some(g);
             }
         }
 
-        *frames.lock().unwrap_or_else(|e| e.into_inner()) = Some(SharedFrame { w, h, rgb });
+        if want_preview {
+            let mut preview = rgb;
+            mirror_rgb(&mut preview, w);
+            *frames.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(SharedFrame { w, h, rgb: preview });
+        }
     }
 }
 
@@ -366,19 +335,32 @@ fn decode_loop(
     work: Arc<Mutex<Option<image::GrayImage>>>,
     res_tx: mpsc::Sender<WifiQr>,
 ) {
+    let started = std::time::Instant::now();
+    let mut misses = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let gray = work.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(g) = gray else {
             std::thread::sleep(Duration::from_millis(30));
             continue;
         };
-        if let Some(qr) = decode_gray_variants(&g) {
-            if res_tx.send(qr).is_ok() {
-                stop.store(true, Ordering::Relaxed);
+        if let Some(qr) = crate::qr::decode_gray_variants(&g) {
+            let done = qr::route(&qr).is_some();
+            if res_tx.send(qr).is_err() {
+                break;
             }
-            break;
+            if done {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        misses += 1;
+        let calm = started.elapsed() > Duration::from_secs(5) || misses > 50;
+        std::thread::sleep(if calm {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_millis(20)
+        });
     }
 }
 pub fn camera_self_test() -> anyhow::Result<()> {
@@ -411,39 +393,17 @@ pub fn camera_self_test() -> anyhow::Result<()> {
     }
     Ok(())
 }
-pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<BackendCmd>) {
+pub fn open_scanner(
+    app: &gtk4::Application,
+    on_code: Rc<dyn Fn(&WifiQr) -> bool>,
+) -> gtk4::ApplicationWindow {
     crate::ui::load_css();
     let window = gtk4::ApplicationWindow::new(app);
     window.set_title(Some("Scan QR code"));
     window.add_css_class("rnet-window");
-    let (mw, mh) = gtk4::gdk::Display::default()
-        .and_then(|d| {
-            let monitors = d.monitors();
-            if monitors.n_items() == 0 {
-                return None;
-            }
-            monitors
-                .item(0)
-                .and_then(|o| o.downcast::<gtk4::gdk::Monitor>().ok())
-        })
-        .map(|mon| {
-            let g = mon.geometry();
-            (g.width(), g.height())
-        })
-        .unwrap_or((0, 0));
-    let w = 480;
-    let h = 560;
-    window.set_default_size(w, h);
+    window.set_default_size(480, 560);
     window.init_layer_shell();
     window.set_layer(Layer::Top);
-    window.set_anchor(Edge::Top, true);
-    window.set_anchor(Edge::Bottom, true);
-    window.set_anchor(Edge::Left, true);
-    window.set_anchor(Edge::Right, true);
-    window.set_margin(Edge::Top, ((mh - h) / 2).max(0));
-    window.set_margin(Edge::Bottom, ((mh - h) / 2).max(0));
-    window.set_margin(Edge::Left, ((mw - w) / 2).max(0));
-    window.set_margin(Edge::Right, ((mw - w) / 2).max(0));
     window.set_exclusive_zone(0);
     window.set_keyboard_mode(KeyboardMode::OnDemand);
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -473,6 +433,24 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
     let stop = Arc::new(AtomicBool::new(false));
     let frames: Arc<Mutex<Option<SharedFrame>>> = Arc::new(Mutex::new(None));
     let work: Arc<Mutex<Option<image::GrayImage>>> = Arc::new(Mutex::new(None));
+    let tick_id: Rc<std::cell::RefCell<Option<gtk4::glib::SourceId>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let shutdown = {
+        let stop = stop.clone();
+        let frames = frames.clone();
+        let work = work.clone();
+        let tick_id = tick_id.clone();
+        let picture = picture.clone();
+        Rc::new(move || {
+            stop.store(true, Ordering::Relaxed);
+            if let Some(id) = tick_id.borrow_mut().take() {
+                id.remove();
+            }
+            picture.set_paintable(Option::<&gtk4::gdk::Texture>::None);
+            frames.lock().unwrap_or_else(|e| e.into_inner()).take();
+            work.lock().unwrap_or_else(|e| e.into_inner()).take();
+        })
+    };
     let (res_tx, res_rx) = mpsc::channel::<WifiQr>();
     let (status_tx, status_rx) = mpsc::channel::<String>();
     {
@@ -487,31 +465,35 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
         std::thread::spawn(move || decode_loop(stop, work, res_tx));
     }
     {
-        let stop = stop.clone();
+        let shutdown = shutdown.clone();
         window.connect_close_request(move |_| {
-            stop.store(true, Ordering::Relaxed);
+            shutdown();
             gtk4::glib::Propagation::Proceed
         });
     }
     {
         let window = window.clone();
+        let shutdown = shutdown.clone();
         close_btn.connect_clicked(move |_| {
-            stop.store(true, Ordering::Relaxed);
+            shutdown();
             window.close();
         });
     }
     {
-        let cmd_tx = cmd_tx.clone();
+        let on_code = on_code.clone();
+        let window = window.clone();
         file_btn.connect_clicked(move |_| {
-            let cmd_tx = cmd_tx.clone();
+            let on_code = on_code.clone();
+            let window = window.clone();
             gtk4::glib::MainContext::default().spawn_local(async move {
-                file_scan_flow(cmd_tx).await;
+                file_scan_flow(on_code, window).await;
             });
         });
     }
-    let cmd_tx_tick = cmd_tx.clone();
+    let on_code_tick = on_code.clone();
     let window_tick = window.clone();
-    gtk4::glib::timeout_add_local(PREVIEW_TICK, move || {
+    let tick_id_sink = tick_id.clone();
+    *tick_id_sink.borrow_mut() = Some(gtk4::glib::timeout_add_local(PREVIEW_TICK, move || {
         if let Ok(s) = status_rx.try_recv() {
             status.set_text(&s);
         }
@@ -532,20 +514,119 @@ pub fn open_scanner(app: &gtk4::Application, cmd_tx: async_channel::Sender<Backe
         if let Ok(code) = res_rx.try_recv() {
             tracing::info!(ssid = %code.ssid, "QR scanned from camera");
             status.set_text(&format!("Connecting to {}…", code.ssid));
-            if let Some(cmd) = qr::route(&code) {
-                let _ = cmd_tx_tick.try_send(cmd);
-            } else {
-                status.set_text("Unsupported QR code");
-                return gtk4::glib::ControlFlow::Continue;
+            if on_code_tick(&code) {
+                let window_tick = window_tick.clone();
+                gtk4::glib::timeout_add_local_once(Duration::from_secs(1), move || {
+                    window_tick.close();
+                });
+                return gtk4::glib::ControlFlow::Break;
             }
-            let window_tick = window_tick.clone();
-            gtk4::glib::timeout_add_local_once(Duration::from_secs(1), move || {
-                window_tick.close();
-            });
-            return gtk4::glib::ControlFlow::Break;
+            status.set_text("Unsupported QR code");
+            return gtk4::glib::ControlFlow::Continue;
         }
         gtk4::glib::ControlFlow::Continue
+    }));
+    window
+}
+fn qr_json(qr: &WifiQr) -> serde_json::Value {
+    serde_json::json!({
+        "ssid": qr.ssid,
+        "psk": qr.password.as_deref().unwrap_or(""),
+        "hidden": qr.hidden,
+        "security": match qr.security {
+            qr::WifiSecurity::Open => "Open",
+            qr::WifiSecurity::Wpa => "Wpa",
+            _ => "Other",
+        },
+    })
+}
+
+fn child_output_to_cmd(out: &[u8]) -> Option<BackendCmd> {
+    let line = out
+        .split(|b| *b == b'\n')
+        .filter_map(|l| {
+            let s = std::str::from_utf8(l).ok()?;
+            let s = s.trim();
+            (!s.is_empty()).then_some(s)
+        })
+        .next_back()?;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ssid = v.get("ssid")?.as_str()?;
+    if ssid.is_empty() {
+        return None;
+    }
+    let password = match v.get("psk")?.as_str()? {
+        "" => None,
+        p => Some(crate::state::Secret::from(p)),
+    };
+    let hidden = v.get("hidden")?.as_bool()?;
+    let security = match v.get("security")?.as_str()? {
+        "Open" => qr::WifiSecurity::Open,
+        "Wpa" => qr::WifiSecurity::Wpa,
+        _ => return None,
+    };
+    qr::route(&WifiQr {
+        ssid: ssid.to_string(),
+        password,
+        hidden,
+        security,
+    })
+}
+
+pub async fn run_scanner_child() -> Option<BackendCmd> {
+    let exe = std::env::current_exe().ok()?;
+    let out = tokio::time::timeout(
+        Duration::from_secs(180),
+        tokio::process::Command::new(exe)
+            .arg("--scan-qr")
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    child_output_to_cmd(&out.stdout)
+}
+
+pub fn scanner_child(parent_pid: Option<u32>) -> anyhow::Result<()> {
+    if let Some(ppid) = parent_pid {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                if std::os::unix::process::parent_id() != ppid {
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+    let app = gtk4::Application::new(
+        Some("dev.abhinash-pdl.rnetapplet.Scanner"),
+        gtk4::gio::ApplicationFlags::NON_UNIQUE,
+    );
+    app.connect_activate(move |app| {
+        let quit = app.clone();
+        let on_code = Rc::new(move |code: &WifiQr| {
+            if qr::route(code).is_none() {
+                return false;
+            }
+            println!("{}", qr_json(code));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            quit.quit();
+            true
+        });
+        let window = open_scanner(app, on_code);
+        let quit = app.clone();
+        window.connect_hide(move |_| quit.quit());
     });
+    app.run_with_args::<&str>(&[]);
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -594,10 +675,66 @@ mod tests {
         assert!(work_gray_from_rgb(&[], 0, 4).is_none(), "zero width");
     }
     #[test]
+    fn mirror_rgb_reverses_each_row() {
+        let mut rgb = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        mirror_rgb(&mut rgb, 2);
+        assert_eq!(rgb, vec![4u8, 5, 6, 1, 2, 3, 10, 11, 12, 7, 8, 9]);
+        let mut odd = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9];
+        mirror_rgb(&mut odd, 3);
+        assert_eq!(odd, vec![7u8, 8, 9, 4, 5, 6, 1, 2, 3]);
+        let mut empty: Vec<u8> = Vec::new();
+        mirror_rgb(&mut empty, 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn child_output_parses_to_connect() {
+        let out = b"tracing noise\n{\"ssid\":\"Cafe\",\"psk\":\"hunter2\",\"hidden\":false,\"security\":\"Wpa\"}\n";
+        let cmd = child_output_to_cmd(out).expect("parse");
+        assert!(matches!(cmd, BackendCmd::ConnectSecure { .. }));
+        assert!(child_output_to_cmd(b"").is_none());
+        assert!(child_output_to_cmd(b"not json\n").is_none());
+        assert!(
+            child_output_to_cmd(
+                b"{\"ssid\":\"\",\"psk\":\"\",\"hidden\":false,\"security\":\"Wpa\"}\n"
+            )
+            .is_none()
+        );
+        assert!(
+            child_output_to_cmd(
+                b"{\"ssid\":\"C\",\"psk\":\"\",\"hidden\":false,\"security\":\"Other\"}\n"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn child_output_hidden_open_routes() {
+        let out = b"{\"ssid\":\"C\",\"psk\":\"\",\"hidden\":true,\"security\":\"Open\"}\n";
+        assert!(matches!(
+            child_output_to_cmd(out),
+            Some(BackendCmd::ConnectHidden { .. })
+        ));
+    }
+
+    #[test]
+    fn child_output_hidden_wpa_round_trip() {
+        let qr = WifiQr {
+            ssid: "H".into(),
+            password: Some(crate::state::Secret::from("hunter2")),
+            hidden: true,
+            security: crate::qr::WifiSecurity::Wpa,
+        };
+        let rendered = qr_json(&qr).to_string();
+        let cmd = child_output_to_cmd(rendered.as_bytes()).expect("parse");
+        assert!(matches!(cmd, BackendCmd::ConnectHidden { .. }));
+    }
+
+    #[test]
     fn work_dims_is_bounded_in_both_directions() {
         assert_eq!(work_dims(1920, 1080), (960, 540));
         assert_eq!(work_dims(800, 600), (800, 600), "already in range");
-        assert_eq!(work_dims(200, 3000), (192, 2880));
+        assert_eq!(work_dims(200, 3000), (64, 960));
         assert_eq!(work_dims(0, 100), (0, 0));
     }
 }

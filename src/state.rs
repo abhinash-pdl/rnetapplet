@@ -1,51 +1,145 @@
+use crate::nm_client::aps::{Bands, Security};
 use std::sync::Arc;
 use tokio::sync::watch;
-#[derive(Debug, Clone, PartialEq, Eq)]
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct Ssid(String);
+
+impl Ssid {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Ssid {
+    fn from(inner: String) -> Self {
+        Self(inner)
+    }
+}
+
+impl From<&str> for Ssid {
+    fn from(inner: &str) -> Self {
+        Self(inner.to_string())
+    }
+}
+
+impl std::fmt::Display for Ssid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for Ssid {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for Ssid {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Ssid {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::borrow::Borrow<str> for Ssid {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(inner: String) -> Self {
+        Self(inner)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(inner: &str) -> Self {
+        Self(inner.to_string())
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        let mut bytes = std::mem::take(&mut self.0).into_bytes();
+        bytes.fill(0);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Ap {
-    pub ssid: String,
-    pub bands: u8,
+    pub ssid: Ssid,
+    pub bands: Bands,
     pub strength: u8,
-    pub secured: bool,
-    pub enterprise: bool,
-    pub wep: bool,
+    pub security: Security,
     pub freq_mhz: Option<u32>,
     pub saved: bool,
 
     pub known: bool,
     pub priority: i32,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VpnConnection {
     pub id: String,
     pub active: bool,
 
     pub path: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HotspotInfo {
-    pub ssid: String,
-    pub psk: Option<String>,
+    pub ssid: Ssid,
+    pub psk: Option<Secret>,
     pub active: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiredInfo {
     pub id: String,
     pub iface: String,
     pub ipv4: Option<String>,
     pub speed_mbps: Option<u32>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Model {
     pub aps: Arc<[Ap]>,
-    pub active_ssid: Option<String>,
-    pub activating_ssid: Option<String>,
+    pub active_ssid: Option<Ssid>,
+    pub activating_ssid: Option<Ssid>,
     pub active_iface: Option<String>,
     pub active_ipv4: Option<String>,
     pub active_bitrate_kbps: Option<u32>,
     pub active_gateway: Option<String>,
     pub active_dns: Vec<String>,
     pub active_freq_mhz: Option<u32>,
-    pub saved_ssids: Arc<[String]>,
     pub wired: Option<WiredInfo>,
     pub hotspot: Option<HotspotInfo>,
     pub wifi_enabled: bool,
@@ -54,6 +148,7 @@ pub struct Model {
     pub no_internet: bool,
     pub primary_wired: bool,
     pub vpn_connections: Arc<[VpnConnection]>,
+    pub last_good: Option<Ssid>,
 }
 impl Model {
     pub fn empty() -> Self {
@@ -82,42 +177,41 @@ pub type ModelRx = watch::Receiver<Arc<Model>>;
 pub fn channel() -> (ModelTx, ModelRx) {
     watch::channel(Arc::new(Model::empty()))
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BackendCmd {
-    TogglePopup(Option<(i32, i32)>),
     Rescan,
 
     Refresh,
-    ConnectOpen(String),
-    ConnectSaved(String),
+    ConnectOpen(Ssid),
+    ConnectSaved(Ssid),
     ConnectSecure {
-        ssid: String,
-        psk: String,
+        ssid: Ssid,
+        psk: Secret,
     },
-    #[allow(dead_code)]
     ProvideSecret {
-        ssid: String,
+        ssid: Ssid,
         path: String,
-        psk: String,
+        psk: Secret,
     },
 
     RetrySaved {
-        ssid: String,
-        psk: String,
+        ssid: Ssid,
+        psk: Secret,
         stale_path: Option<String>,
     },
+    CancelAttempt(Ssid),
     SetAirplane(bool),
     CreateHotspot {
-        ssid: String,
-        psk: String,
+        ssid: Ssid,
+        psk: Secret,
     },
     StopHotspot,
-    Forget(String),
+    Forget(Ssid),
     ConnectHidden {
-        ssid: String,
-        psk: String,
+        ssid: Ssid,
+        psk: Secret,
     },
-    ExpandRow(String),
+    ExpandRow(Ssid),
     SetWifi(bool),
     RefreshTray,
     DisconnectActive,
@@ -125,17 +219,17 @@ pub enum BackendCmd {
     DeactivateVpn(String),
     Quit,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum UiEvent {
     Model(Arc<Model>),
     BackendError(String),
-    ExpandRow(String),
+    ExpandRow(Ssid),
     SsidError {
-        ssid: String,
+        ssid: Ssid,
         message: String,
     },
     SecretsNeeded {
-        ssid: String,
+        ssid: Ssid,
         path: String,
         request_new: bool,
     },
@@ -169,16 +263,23 @@ mod tests {
     fn ap(ssid: &str, strength: u8) -> Ap {
         Ap {
             priority: 0,
-            bands: 0,
+            bands: Bands::NONE,
             ssid: ssid.into(),
             strength,
-            secured: true,
-            enterprise: false,
-            wep: false,
+            security: Security::Wpa,
             freq_mhz: None,
             saved: false,
             known: false,
         }
+    }
+    #[test]
+    fn identical_models_compare_equal() {
+        let a = Model::empty();
+        let b = Model::empty();
+        assert_eq!(a, b);
+        let mut changed = b;
+        changed.no_internet = true;
+        assert_ne!(a, changed);
     }
     #[test]
     fn empty_model_is_online() {

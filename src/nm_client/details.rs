@@ -1,5 +1,6 @@
 use super::NmClient;
-use crate::state::{HotspotInfo, WiredInfo};
+use super::uncached_proxy;
+use crate::state::{HotspotInfo, Secret, Ssid, WiredInfo};
 use anyhow::Result;
 use zbus::zvariant::OwnedObjectPath;
 pub struct ActiveNet {
@@ -21,9 +22,11 @@ pub async fn active_details(client: &NmClient, wifi_path: Option<OwnedObjectPath
             freq_mhz: None,
         };
     };
-    let Ok(dev) =
-        rusty_network_manager::DeviceProxy::new_from_path(wifi.clone(), client.system_conn()).await
-    else {
+    let Some(dev) = uncached_proxy!(
+        rusty_network_manager::DeviceProxy,
+        client.system_conn(),
+        wifi.clone()
+    ) else {
         return ActiveNet {
             iface: None,
             ipv4: None,
@@ -47,19 +50,24 @@ pub async fn active_details(client: &NmClient, wifi_path: Option<OwnedObjectPath
         Some(p) => read_dns(client, &p).await,
         None => Vec::new(),
     };
-    let wireless =
-        rusty_network_manager::WirelessProxy::new_from_path(wifi, client.system_conn()).await;
+    let wireless = uncached_proxy!(
+        rusty_network_manager::WirelessProxy,
+        client.system_conn(),
+        wifi
+    );
     let mut bitrate = None;
     let mut ap_path = None;
-    if let Ok(w) = wireless.as_ref() {
+    if let Some(w) = wireless.as_ref() {
         bitrate = w.bitrate().await.ok().filter(|b| *b > 0);
         ap_path = w.active_access_point().await.ok();
     }
     let mut freq_mhz = None;
     if let Some(ap_path) = ap_path.filter(|p| p.as_str() != "/")
-        && let Ok(ap) =
-            rusty_network_manager::AccessPointProxy::new_from_path(ap_path, client.system_conn())
-                .await
+        && let Some(ap) = uncached_proxy!(
+            rusty_network_manager::AccessPointProxy,
+            client.system_conn(),
+            ap_path
+        )
     {
         freq_mhz = ap.frequency().await.ok();
     }
@@ -73,10 +81,11 @@ pub async fn active_details(client: &NmClient, wifi_path: Option<OwnedObjectPath
     }
 }
 async fn read_first_address(client: &NmClient, path: &OwnedObjectPath) -> Option<String> {
-    let proxy =
-        rusty_network_manager::IP4ConfigProxy::new_from_path(path.clone(), client.system_conn())
-            .await
-            .ok()?;
+    let proxy = uncached_proxy!(
+        rusty_network_manager::IP4ConfigProxy,
+        client.system_conn(),
+        path.clone()
+    )?;
     let data = proxy.address_data().await.ok()?;
     let first = data.first()?;
     match &**first.get("address")? {
@@ -85,10 +94,11 @@ async fn read_first_address(client: &NmClient, path: &OwnedObjectPath) -> Option
     }
 }
 async fn read_gateway(client: &NmClient, path: &OwnedObjectPath) -> Option<String> {
-    let proxy =
-        rusty_network_manager::IP4ConfigProxy::new_from_path(path.clone(), client.system_conn())
-            .await
-            .ok()?;
+    let proxy = uncached_proxy!(
+        rusty_network_manager::IP4ConfigProxy,
+        client.system_conn(),
+        path.clone()
+    )?;
     proxy
         .gateway()
         .await
@@ -96,10 +106,11 @@ async fn read_gateway(client: &NmClient, path: &OwnedObjectPath) -> Option<Strin
         .filter(|s| !s.is_empty() && s != "0.0.0.0")
 }
 async fn read_dns(client: &NmClient, path: &OwnedObjectPath) -> Vec<String> {
-    let Ok(proxy) =
-        rusty_network_manager::IP4ConfigProxy::new_from_path(path.clone(), client.system_conn())
-            .await
-    else {
+    let Some(proxy) = uncached_proxy!(
+        rusty_network_manager::IP4ConfigProxy,
+        client.system_conn(),
+        path.clone()
+    ) else {
         return Vec::new();
     };
     let Ok(data) = proxy.nameserver_data().await else {
@@ -116,7 +127,7 @@ async fn read_dns(client: &NmClient, path: &OwnedObjectPath) -> Vec<String> {
 pub async fn wired_status(client: &NmClient) -> Option<WiredInfo> {
     use rusty_network_manager::ActiveProxy;
     for path in client.nm.active_connections().await.unwrap_or_default() {
-        let Ok(proxy) = ActiveProxy::new_from_path(path.clone(), client.system_conn()).await else {
+        let Some(proxy) = uncached_proxy!(ActiveProxy, client.system_conn(), path.clone()) else {
             continue;
         };
         if proxy.type_().await.as_deref() != Ok("802-3-ethernet") {
@@ -133,8 +144,8 @@ pub async fn wired_status(client: &NmClient) -> Option<WiredInfo> {
             .and_then(|d| d.into_iter().next());
         let mut iface = String::new();
         if let Some(dp) = device_path.clone()
-            && let Ok(dev) =
-                rusty_network_manager::DeviceProxy::new_from_path(dp, client.system_conn()).await
+            && let Some(dev) =
+                uncached_proxy!(rusty_network_manager::DeviceProxy, client.system_conn(), dp)
             && let Ok(name) = dev.interface().await
         {
             iface = name;
@@ -183,14 +194,15 @@ pub async fn hotspot_status(client: &NmClient) -> Result<Option<HotspotInfo>> {
             .get("802-11-wireless")
             .and_then(|w| w.get("ssid"))
             .and_then(super::bytes_to_ssid);
-        let ssid = from_map.unwrap_or_else(|| "hotspot".into());
-        let psk = map
+        let ssid = Ssid::from(from_map.unwrap_or_else(|| "hotspot".into()));
+        let psk: Option<Secret> = map
             .get("802-11-wireless-security")
             .and_then(|w| w.get("psk"))
             .and_then(|v| match &**v {
                 zbus::zvariant::Value::Str(s) => Some(s.to_string()),
                 _ => None,
-            });
+            })
+            .map(Secret::from);
         return Ok(Some(HotspotInfo {
             ssid,
             psk,
@@ -199,8 +211,8 @@ pub async fn hotspot_status(client: &NmClient) -> Result<Option<HotspotInfo>> {
     }
     if let Ok(Some((ssid, psk))) = client.saved_hotspot_config().await {
         return Ok(Some(HotspotInfo {
-            ssid,
-            psk,
+            ssid: ssid.into(),
+            psk: psk.map(Secret::from),
             active: false,
         }));
     }

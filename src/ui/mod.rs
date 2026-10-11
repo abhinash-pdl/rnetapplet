@@ -1,9 +1,10 @@
 mod appearance;
+pub(crate) mod child;
 mod hidden;
 mod hotspot;
 mod list;
 mod notify;
-mod placement;
+pub(crate) mod placement;
 mod row;
 mod state;
 mod theme;
@@ -26,7 +27,7 @@ use row::flat_icon_button;
 use state::UiHandles;
 use theme::{header_icon_px, themed_icon};
 
-use crate::state::{BackendCmd, Model, UiEvent};
+use crate::state::{BackendCmd, Model, Ssid, UiEvent};
 
 const POPUP_W: i32 = 425;
 
@@ -154,19 +155,23 @@ pub(crate) fn apply_popup_height(
 }
 
 pub(crate) fn load_css() {
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(CSS);
-    let Some(display) = gtk4::gdk::Display::default() else {
-        tracing::warn!("no display; skipping applet CSS");
-        return;
-    };
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_USER,
-    );
+    static CSS_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CSS_ONCE.get_or_init(|| {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(CSS);
+        let Some(display) = gtk4::gdk::Display::default() else {
+            tracing::warn!("no display; skipping applet CSS");
+            return;
+        };
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     initial: Model,
     ui_rx: async_channel::Receiver<UiEvent>,
@@ -175,6 +180,7 @@ pub fn run(
     cmd_tx: async_channel::Sender<BackendCmd>,
     popup_visible: Arc<AtomicBool>,
     scan_frozen: Arc<AtomicBool>,
+    exit_on_close: bool,
 ) {
     gtk4::glib::log_set_default_handler(|_d, level, msg| {
         if matches!(level, gtk4::glib::LogLevel::Error) {
@@ -199,15 +205,15 @@ pub fn run(
         let query = Rc::new(RefCell::new(String::new()));
         let visible = Rc::new(Cell::new(false));
         let prog_guard = Rc::new(Cell::new(false));
-        let errors: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
-        let pw_drafts: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
-        let focus_ssid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let pending_secret_paths: Rc<RefCell<HashMap<String, String>>> =
+        let errors: Rc<RefCell<HashMap<Ssid, String>>> = Rc::new(RefCell::new(HashMap::new()));
+        let pw_drafts: Rc<RefCell<HashMap<Ssid, String>>> = Rc::new(RefCell::new(HashMap::new()));
+        let focus_ssid: Rc<RefCell<Option<Ssid>>> = Rc::new(RefCell::new(None));
+        let pending_secret_paths: Rc<RefCell<HashMap<Ssid, String>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let connecting: Rc<RefCell<HashMap<String, std::time::Instant>>> =
+        let connecting: Rc<RefCell<HashMap<Ssid, std::time::Instant>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let pw_attempt: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
-        let unsaved_attempt: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+        let pw_attempt: Rc<RefCell<HashSet<Ssid>>> = Rc::new(RefCell::new(HashSet::new()));
+        let unsaved_attempt: Rc<RefCell<HashSet<Ssid>>> = Rc::new(RefCell::new(HashSet::new()));
         let hidden_expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let hidden_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let hidden_card: Rc<RefCell<Option<(gtk4::Revealer, gtk4::ListBoxRow)>>> =
@@ -223,22 +229,22 @@ pub fn run(
         let speeds: Rc<RefCell<(Option<u64>, Option<u64>)>> = Rc::new(RefCell::new((None, None)));
         let speed_labels: Rc<RefCell<Option<(gtk4::Label, gtk4::Label)>>> =
             Rc::new(RefCell::new(None));
-        let revealers: Rc<RefCell<HashMap<String, gtk4::Revealer>>> =
+        let revealers: Rc<RefCell<HashMap<Ssid, gtk4::Revealer>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let chevrons: Rc<RefCell<HashMap<String, gtk4::Image>>> =
+        let chevrons: Rc<RefCell<HashMap<Ssid, gtk4::Image>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let rows: Rc<RefCell<HashMap<String, gtk4::ListBoxRow>>> =
+        let rows: Rc<RefCell<HashMap<Ssid, gtk4::ListBoxRow>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let action_btns: Rc<RefCell<HashMap<String, state::ActionBtn>>> = Default::default();
-        let card_actions: Rc<RefCell<HashMap<String, gtk4::Box>>> = Default::default();
-        let status: Rc<RefCell<HashMap<String, gtk4::Box>>> = Rc::new(RefCell::new(HashMap::new()));
-        let error_labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
+        let action_btns: Rc<RefCell<HashMap<Ssid, state::ActionBtn>>> = Default::default();
+        let card_actions: Rc<RefCell<HashMap<Ssid, gtk4::Box>>> = Default::default();
+        let status: Rc<RefCell<HashMap<Ssid, gtk4::Box>>> = Rc::new(RefCell::new(HashMap::new()));
+        let error_labels: Rc<RefCell<HashMap<Ssid, gtk4::Label>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let ssid_labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
+        let ssid_labels: Rc<RefCell<HashMap<Ssid, gtk4::Label>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let pw_entries: Rc<RefCell<HashMap<String, gtk4::PasswordEntry>>> =
+        let pw_entries: Rc<RefCell<HashMap<Ssid, gtk4::PasswordEntry>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let strength_setters: Rc<RefCell<HashMap<String, theme::StrengthSetter>>> =
+        let strength_setters: Rc<RefCell<HashMap<Ssid, theme::StrengthSetter>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let hide_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let pending_height: Rc<Cell<i32>> = Rc::new(Cell::new(0));
@@ -449,9 +455,9 @@ pub fn run(
         popup_revealer.set_valign(gtk4::Align::Start);
         overlay.add_overlay(&popup_revealer);
 
-        let expanded = Rc::new(std::cell::RefCell::new(None::<String>));
+        let expanded = Rc::new(std::cell::RefCell::new(None::<Ssid>));
         let extra_heights = Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
-            String,
+            Ssid,
             i32,
         >::new()));
         let popup_scale = Rc::new(std::cell::Cell::new(output_scale_for_x(None)));
@@ -630,6 +636,7 @@ pub fn run(
             hidden_entries: Rc::new(RefCell::new(Vec::new())),
             hotspot_entries: Rc::new(RefCell::new(Vec::new())),
             was_editing: Rc::new(Cell::new(false)),
+            notify_gen: Rc::new(Cell::new(0)),
             in_refresh: Rc::new(Cell::new(false)),
             pw_hovered: Rc::new(Cell::new(false)),
             scan_frozen: scan_frozen.clone(),
@@ -637,7 +644,6 @@ pub fn run(
             pending_rebuild: pending_rebuild.clone(),
             rebuild_queued: Rc::new(Cell::new(false)),
             last_strengths: Rc::new(RefCell::new(HashMap::new())),
-            ap_misses: Rc::new(RefCell::new(HashMap::new())),
             cmd_tx: cmd_tx.clone(),
         };
         *h.search_entry.borrow_mut() = Some(search.clone().upcast());
@@ -665,7 +671,13 @@ pub fn run(
             let size_c = size.clone();
             let hide_gen_c = hide_gen.clone();
             let h_c = h.clone();
+            let app_c = app.clone();
             window.connect_close_request(move |_| {
+                if exit_on_close {
+                    tracing::info!("popup child closing");
+                    app_c.quit();
+                    return gtk4::glib::Propagation::Stop;
+                }
                 if visible.get() {
                     flag.store(false, Ordering::Relaxed);
                     hide_popup(&window_c, &revealer_c, &size_c, &visible, &hide_gen_c);
@@ -684,8 +696,13 @@ pub fn run(
             let flag_b = popup_visible.clone();
             let hide_gen_b = hide_gen.clone();
             let h_b = h.clone();
+            let app_b = app.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.connect_pressed(move |_, _, _, _| {
+                if exit_on_close {
+                    app_b.quit();
+                    return;
+                }
                 if visible_b.get() {
                     flag_b.store(false, Ordering::Relaxed);
                     hide_popup(&window_b, &revealer_b, &size_b, &visible_b, &hide_gen_b);
@@ -719,15 +736,15 @@ pub fn run(
                 if let Some(cfg) = hs {
                     let draft_psk = h.hotspot_psk.borrow().clone();
                     let psk = if draft_psk.is_empty() {
-                        cfg.psk.clone().unwrap_or_default()
+                        cfg.psk.clone().unwrap_or_else(|| "".into())
                     } else {
-                        draft_psk
+                        draft_psk.into()
                     };
                     let draft_ssid = h.hotspot_ssid.borrow().clone();
                     let ssid = if draft_ssid.is_empty() {
                         cfg.ssid.clone()
                     } else {
-                        draft_ssid
+                        draft_ssid.into()
                     };
                     if !ssid.trim().is_empty() && (8..=63).contains(&psk.len()) {
                         h.hotspot_error.borrow_mut().take();
@@ -796,10 +813,32 @@ pub fn run(
         }
 
         {
-            let app = app.clone();
             let cmd_tx = cmd_tx.clone();
+            let busy = Arc::new(AtomicBool::new(false));
             qr.connect_clicked(move |_| {
-                crate::qr_scan::open_scanner(&app, cmd_tx.clone());
+                if busy.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("scanner already running");
+                    return;
+                }
+                let cmd_tx = cmd_tx.clone();
+                let busy = busy.clone();
+                std::thread::spawn(move || {
+                    let cmd = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("scanner runtime")
+                            .block_on(crate::qr_scan::run_scanner_child())
+                    }))
+                    .ok()
+                    .flatten();
+                    gtk4::glib::MainContext::default().invoke(move || {
+                        if let Some(cmd) = cmd {
+                            let _ = cmd_tx.try_send(cmd);
+                        }
+                        busy.store(false, Ordering::SeqCst);
+                    });
+                });
             });
         }
 
@@ -847,9 +886,14 @@ pub fn run(
             let flag_e = popup_visible.clone();
             let hide_gen_e = hide_gen.clone();
             let h_e = h.clone();
+            let app_e = app.clone();
             let keys = gtk4::EventControllerKey::new();
             keys.connect_key_pressed(move |_, key, _, _| {
                 if key == Key::Escape {
+                    if exit_on_close {
+                        app_e.quit();
+                        return gtk4::glib::Propagation::Stop;
+                    }
                     flag_e.store(false, Ordering::Relaxed);
                     hide_popup(&window_e, &revealer_e, &size_e, &visible_e, &hide_gen_e);
                     (h_e.grow_by)(i32::MIN);
@@ -908,14 +952,30 @@ pub fn run(
                             {
                                 let prev = h.model.borrow().active_ssid.clone();
                                 if prev.as_deref() != m.active_ssid.as_deref() {
-                                    match m.active_ssid.as_deref() {
-                                        Some(ssid) => notify::send("Connected", ssid),
-                                        None => {
-                                            if let Some(was) = prev.as_deref() {
-                                                notify::send("Disconnected", was);
+                                    let target = m.active_ssid.clone();
+                                    let epoch = h.notify_gen.get() + 1;
+                                    h.notify_gen.set(epoch);
+                                    let h2 = h.clone();
+                                    gtk4::glib::timeout_add_local_once(
+                                        std::time::Duration::from_secs(3),
+                                        move || {
+                                            if h2.notify_gen.get() != epoch {
+                                                return;
                                             }
-                                        }
-                                    }
+                                            let cur = h2.model.borrow().active_ssid.clone();
+                                            if cur != target {
+                                                return;
+                                            }
+                                            match target.as_deref() {
+                                                Some(ssid) => notify::send("Connected", ssid),
+                                                None => {
+                                                    if let Some(was) = prev.as_deref() {
+                                                        notify::send("Disconnected", was);
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
                                 }
                             }
 
@@ -938,12 +998,12 @@ pub fn run(
 
                             if let Some(hs) = m.hotspot.as_ref() {
                                 if h.hotspot_ssid.borrow().is_empty() {
-                                    *h.hotspot_ssid.borrow_mut() = hs.ssid.clone();
+                                    *h.hotspot_ssid.borrow_mut() = hs.ssid.to_string();
                                 }
                                 if h.hotspot_psk.borrow().is_empty()
                                     && let Some(psk) = hs.psk.clone()
                                 {
-                                    *h.hotspot_psk.borrow_mut() = psk;
+                                    *h.hotspot_psk.borrow_mut() = psk.to_string();
                                 }
                             }
                             apply_model(&h, m);
@@ -954,6 +1014,7 @@ pub fn run(
                             request_new,
                         } => {
                             h.connecting.borrow_mut().remove(&ssid);
+                            row::set_row_connecting(&h, &ssid, false);
                             if request_new {
                                 if h.unsaved_attempt.borrow_mut().remove(&ssid) {
                                     h.pending_secret_paths.borrow_mut().remove(&ssid);
@@ -962,6 +1023,8 @@ pub fn run(
                                     h.pending_secret_paths
                                         .borrow_mut()
                                         .insert(ssid.clone(), path);
+                                    let _ =
+                                        h.cmd_tx.try_send(BackendCmd::CancelAttempt(ssid.clone()));
                                 }
 
                                 if let Some(entry) = h.pw_entries.borrow().get(&ssid).cloned() {
@@ -983,11 +1046,14 @@ pub fn run(
                             h.connecting.borrow_mut().remove(&ssid);
                             h.pw_attempt.borrow_mut().remove(&ssid);
                             h.unsaved_attempt.borrow_mut().remove(&ssid);
+                            row::set_row_connecting(&h, &ssid, false);
                             if h.ssid_labels.borrow().contains_key(&ssid) {
-                                row::flash_error(&h, &ssid, &message);
+                                if !h.errors.borrow().contains_key(&ssid) {
+                                    row::flash_error(&h, &ssid, &message);
+                                }
                                 row::set_expanded(&h, Some(&ssid));
                             } else {
-                                tracing::info!(%ssid, "connect failed: {message}");
+                                tracing::info!(ssid = %ssid.as_str(), "connect failed: {message}");
                                 *h.hidden_error.borrow_mut() =
                                     Some(format!("Failed to connect to \u{201c}{ssid}\u{201d}"));
                                 request_rebuild(&h);
@@ -1105,5 +1171,5 @@ pub fn run(
         }
     });
 
-    app.run();
+    app.run_with_args::<&str>(&[]);
 }

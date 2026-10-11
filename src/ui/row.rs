@@ -6,11 +6,12 @@ use gtk4::prelude::*;
 use super::list::request_rebuild;
 use super::state::UiHandles;
 use super::theme::{net_icon_live, themed_icon};
-use crate::state::{Ap, BackendCmd};
+use crate::nm_client::aps::{Bands, FREQ_2_4_MIN, FREQ_5_MIN, FREQ_6_MIN};
+use crate::state::{Ap, BackendCmd, Secret, Ssid};
 
 pub(crate) const SSID_CHARS: i32 = 18;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) fn detail_line(text: &str) -> gtk4::Label {
     let l = gtk4::Label::new(Some(text));
@@ -97,7 +98,7 @@ pub(crate) fn action_button_with(
     btn
 }
 
-fn target_ssid(cmd: &BackendCmd) -> Option<String> {
+fn target_ssid(cmd: &BackendCmd) -> Option<Ssid> {
     match cmd {
         BackendCmd::ConnectOpen(s)
         | BackendCmd::ConnectSaved(s)
@@ -106,15 +107,15 @@ fn target_ssid(cmd: &BackendCmd) -> Option<String> {
     }
 }
 
-pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
-    let target = target.as_deref();
+pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<Ssid>) {
+    let target = target.as_ref();
     for (ssid, rev) in h.revealers.borrow().iter() {
-        let open = target == Some(ssid.as_str());
+        let open = target == Some(ssid);
         rev.set_transition_duration(crate::ui::motion::REVEAL_MS);
         rev.set_reveal_child(open);
     }
     for (ssid, img) in h.chevrons.borrow().iter() {
-        let name = if target == Some(ssid.as_str()) {
+        let name = if target == Some(ssid) {
             "pan-up-symbolic"
         } else {
             "pan-down-symbolic"
@@ -127,11 +128,11 @@ pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
             .borrow()
             .aps
             .iter()
-            .any(|ap| &ap.ssid == ssid && !ap.secured)
+            .any(|ap| &ap.ssid == ssid && !ap.security.is_secured())
         {
             continue;
         }
-        let open = target == Some(ssid.as_str());
+        let open = target == Some(ssid);
         let Some(actions) = h.card_actions.borrow().get(ssid).cloned() else {
             continue;
         };
@@ -143,7 +144,7 @@ pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
         }
     }
     for (ssid, l) in h.ssid_labels.borrow().iter() {
-        if target == Some(ssid.as_str()) {
+        if target == Some(ssid) {
             l.set_ellipsize(gtk4::pango::EllipsizeMode::None);
             l.set_max_width_chars(SSID_CHARS);
         } else {
@@ -156,14 +157,17 @@ pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
         if let Some(entry) = entry {
             let h2 = h.clone();
             let expanded = h.expanded.clone();
-            let ssid = ssid.to_string();
+            let ssid = ssid.clone();
             gtk4::glib::timeout_add_local_once(
                 std::time::Duration::from_millis(crate::ui::motion::REVEAL_MS as u64 + 180),
                 move || {
                     if !h2.visible.get() || h2.any_entry_focused() {
                         return;
                     }
-                    if expanded.borrow().as_deref() == Some(ssid.as_str()) && entry.is_mapped() {
+                    if !h2.should_grab_password_focus(&ssid) {
+                        return;
+                    }
+                    if expanded.borrow().as_ref() == Some(&ssid) && entry.is_mapped() {
                         entry.grab_focus();
                     }
                 },
@@ -172,7 +176,7 @@ pub(crate) fn animate_expansion(h: &UiHandles, target: &Option<String>) {
     }
 }
 
-pub(crate) fn show_error_label(h: &UiHandles, ssid: &str, message: Option<&str>) {
+pub(crate) fn show_error_label(h: &UiHandles, ssid: &Ssid, message: Option<&str>) {
     if let Some(label) = h.error_labels.borrow().get(ssid).cloned() {
         match message {
             Some(msg) => {
@@ -189,19 +193,19 @@ pub(crate) fn show_error_label(h: &UiHandles, ssid: &str, message: Option<&str>)
     request_rebuild(h);
 }
 
-pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
-    let target = ssid.map(|s| s.to_string());
+pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&Ssid>) {
+    let target = ssid.cloned();
     if target.is_some() && h.hidden_expanded.get() {
         super::hidden::collapse_hidden(h);
     }
     let previous = h.expanded.borrow().clone();
     *h.focus_ssid.borrow_mut() = target.clone();
     *h.expanded.borrow_mut() = target.clone();
-    let built = match target.as_deref() {
+    let built = match target.as_ref() {
         Some(s) => h.revealers.borrow().contains_key(s),
         None => true,
     };
-    clear_stale_errors(h, target.as_deref());
+    clear_stale_errors(h, target.as_ref());
     if built {
         animate_expansion(h, &target);
         if target.is_some() {
@@ -226,7 +230,7 @@ pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
         _ => 0,
     };
 
-    let reserved = match target.as_deref() {
+    let reserved = match target.as_ref() {
         Some(_) if extra > 0 => {
             if let Some(k) = key.as_ref() {
                 h.extra_heights.borrow_mut().insert(k.clone(), extra);
@@ -234,11 +238,9 @@ pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
             extra
         }
 
-        Some(_) => h
-            .extra_heights
-            .borrow()
-            .get(key.as_deref().unwrap_or(""))
-            .copied()
+        Some(_) => key
+            .as_ref()
+            .and_then(|k| h.extra_heights.borrow().get(k).copied())
             .unwrap_or(0),
         None => {
             if let Some(k) = key.as_ref() {
@@ -248,7 +250,7 @@ pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
         }
     };
     (h.grow)(reserved);
-    if let Some(ssid) = target.as_deref()
+    if let Some(ssid) = target.as_ref()
         && let Some(row) = h.rows.borrow().get(ssid).cloned()
         && let Some(bounds) = row.compute_bounds(&h.list)
     {
@@ -268,6 +270,7 @@ pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
     h.anim_until
         .set(gtk4::glib::monotonic_time() / 1000 + crate::ui::motion::REVEAL_MS as i64);
     (h.fit)();
+    h.sync_focus();
 
     let h2 = h.clone();
     gtk4::glib::timeout_add_local_once(
@@ -278,26 +281,26 @@ pub(crate) fn set_expanded(h: &UiHandles, ssid: Option<&str>) {
     );
 }
 
-pub(crate) fn expander(h: &UiHandles) -> Rc<dyn Fn(Option<String>)> {
+pub(crate) fn expander(h: &UiHandles) -> Rc<dyn Fn(Option<Ssid>)> {
     let h = h.clone();
     Rc::new(move |v| {
-        set_expanded(&h, v.as_deref());
+        set_expanded(&h, v.as_ref());
     })
 }
 
-pub(crate) fn flash_error(h: &UiHandles, ssid: &str, message: &str) {
+pub(crate) fn flash_error(h: &UiHandles, ssid: &Ssid, message: &str) {
     h.errors
         .borrow_mut()
-        .insert(ssid.to_string(), message.to_string());
+        .insert(ssid.clone(), message.to_string());
     show_error_label(h, ssid, Some(message));
 }
 
-pub(crate) fn clear_stale_errors(h: &UiHandles, keep: Option<&str>) {
-    let stale: Vec<String> = h
+pub(crate) fn clear_stale_errors(h: &UiHandles, keep: Option<&Ssid>) {
+    let stale: Vec<Ssid> = h
         .errors
         .borrow()
         .keys()
-        .filter(|s| Some(s.as_str()) != keep)
+        .filter(|s| Some(*s) != keep)
         .cloned()
         .collect();
     for ssid in stale {
@@ -306,7 +309,7 @@ pub(crate) fn clear_stale_errors(h: &UiHandles, keep: Option<&str>) {
     }
 }
 
-pub(crate) fn set_row_connecting(h: &UiHandles, ssid: &str, on: bool) {
+pub(crate) fn set_row_connecting(h: &UiHandles, ssid: &Ssid, on: bool) {
     if let Some(status) = h.status.borrow().get(ssid) {
         status.set_visible(on);
         let mut child = status.first_child();
@@ -327,21 +330,21 @@ pub(crate) fn set_row_connecting(h: &UiHandles, ssid: &str, on: bool) {
     }
 }
 
-pub(crate) fn mark_connecting(h: &UiHandles, ssid: &str, with_password: bool, unsaved: bool) {
+pub(crate) fn mark_connecting(h: &UiHandles, ssid: &Ssid, with_password: bool, unsaved: bool) {
     h.connecting
         .borrow_mut()
-        .insert(ssid.to_string(), Instant::now() + CONNECT_TIMEOUT);
+        .insert(ssid.clone(), Instant::now() + CONNECT_TIMEOUT);
     if with_password {
-        h.pw_attempt.borrow_mut().insert(ssid.to_string());
+        h.pw_attempt.borrow_mut().insert(ssid.clone());
     }
     if unsaved {
-        h.unsaved_attempt.borrow_mut().insert(ssid.to_string());
+        h.unsaved_attempt.borrow_mut().insert(ssid.clone());
     }
     h.errors.borrow_mut().remove(ssid);
 
     {
         let h2 = h.clone();
-        let ssid = ssid.to_string();
+        let ssid = ssid.clone();
         gtk4::glib::timeout_add_local(Duration::from_secs(1), move || {
             if h2.connecting.borrow().contains_key(&ssid) {
                 let _ = h2.cmd_tx.try_send(BackendCmd::Refresh);
@@ -352,14 +355,14 @@ pub(crate) fn mark_connecting(h: &UiHandles, ssid: &str, with_password: bool, un
         });
     }
     let h2 = h.clone();
-    let ssid = ssid.to_string();
+    let ssid = ssid.clone();
     gtk4::glib::timeout_add_local_once(CONNECT_TIMEOUT, move || {
         let expired = h2
             .connecting
             .borrow()
             .get(&ssid)
             .is_some_and(|d| Instant::now() >= *d);
-        let still_off = h2.model.borrow().active_ssid.as_deref() != Some(ssid.as_str());
+        let still_off = h2.model.borrow().active_ssid.as_ref() != Some(&ssid);
         if !expired || !still_off {
             return;
         }
@@ -372,18 +375,18 @@ pub(crate) fn mark_connecting(h: &UiHandles, ssid: &str, with_password: bool, un
             let _ = h2.cmd_tx.try_send(BackendCmd::Forget(ssid.clone()));
         }
         if used_pw {
-            flash_error(&h2, &ssid, "Incorrect password");
+            flash_error(&h2, &ssid, crate::nm_client::connect::MSG_WRONG_PASSWORD);
         } else {
             h2.errors
                 .borrow_mut()
-                .insert(ssid.clone(), "Connection failed".into());
+                .insert(ssid.clone(), crate::nm_client::connect::MSG_FAILED.into());
             request_rebuild(&h2);
         }
     });
 }
 
-fn aps_band(freq_mhz: Option<u32>) -> u8 {
-    crate::nm_client::aps::band_bit(freq_mhz)
+fn aps_band(freq_mhz: Option<u32>) -> Bands {
+    Bands::from_freq(freq_mhz)
 }
 
 pub(crate) struct ActiveInfo<'a> {
@@ -406,11 +409,11 @@ impl ActiveInfo<'_> {
     }
 
     fn band_name(freq_mhz: u32) -> &'static str {
-        if freq_mhz >= 5925 {
+        if freq_mhz >= FREQ_6_MIN {
             "6 GHz"
-        } else if freq_mhz >= 5000 {
+        } else if freq_mhz >= FREQ_5_MIN {
             "5 GHz"
-        } else if freq_mhz >= 2400 {
+        } else if freq_mhz >= FREQ_2_4_MIN {
             "2.4 GHz"
         } else {
             ""
@@ -476,7 +479,10 @@ pub(crate) fn wired_row(info: &crate::state::WiredInfo, h: &UiHandles) -> gtk4::
 pub const MSG_PASSWORD_SHORT: &str = "Password must be at least 8 characters";
 pub const MSG_PASSWORD_LONG: &str = "Password is too long";
 
-pub(crate) fn submit_password(h: &UiHandles, ssid: &str, was_saved: bool) {
+pub(crate) fn submit_password(h: &UiHandles, ssid: &Ssid, was_saved: bool) {
+    if h.connecting.borrow().contains_key(ssid) {
+        return;
+    }
     let from_entry: Option<String> = h
         .pw_entries
         .borrow()
@@ -494,9 +500,7 @@ pub(crate) fn submit_password(h: &UiHandles, ssid: &str, was_saved: bool) {
         None
     };
     if let Some(problem) = problem {
-        h.errors
-            .borrow_mut()
-            .insert(ssid.to_string(), problem.into());
+        h.errors.borrow_mut().insert(ssid.clone(), problem.into());
         request_rebuild(h);
         return;
     }
@@ -506,38 +510,52 @@ pub(crate) fn submit_password(h: &UiHandles, ssid: &str, was_saved: bool) {
     let had_path = stale_path.is_some();
     let cmd = if was_saved {
         BackendCmd::RetrySaved {
-            ssid: ssid.to_string(),
-            psk,
+            ssid: ssid.clone(),
+            psk: Secret::from(psk),
             stale_path,
         }
     } else {
         match stale_path {
             Some(path) => BackendCmd::ProvideSecret {
-                ssid: ssid.to_string(),
+                ssid: ssid.clone(),
                 path,
-                psk,
+                psk: Secret::from(psk),
             },
             None => BackendCmd::ConnectSecure {
-                ssid: ssid.to_string(),
-                psk,
+                ssid: ssid.clone(),
+                psk: Secret::from(psk),
             },
         }
     };
     mark_connecting(h, ssid, true, !was_saved && !had_path);
+    let mut need_fit = false;
     if h.cmd_tx.try_send(cmd).is_err() {
         h.errors
             .borrow_mut()
-            .insert(ssid.to_string(), "Backend busy, try again".into());
+            .insert(ssid.clone(), "Try again".into());
+        need_fit = true;
     }
     *h.expanded.borrow_mut() = None;
     animate_expansion(h, &None);
     set_row_connecting(h, ssid, true);
+    h.extra_heights.borrow_mut().remove(ssid);
+    (h.grow)(0);
+    if need_fit {
+        (h.fit)();
+    }
+    let entry_focused = h.pw_entries.borrow().get(ssid).is_some_and(|entry| {
+        let widget = entry.clone().upcast::<gtk4::Widget>();
+        h.focus_widget().as_ref() == Some(&widget)
+    });
+    if entry_focused && let Some((btn, _, _)) = h.action_btns.borrow().get(ssid) {
+        btn.grab_focus();
+    }
     h.sync_focus();
 }
 
 fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
     let ssid = ap.ssid.clone();
-    let secured = ap.secured;
+    let secured = ap.security.is_secured();
     let saved = ap.saved;
     let h2 = h.clone();
     action_button_with("Connect", false, move || {
@@ -557,7 +575,7 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
                 .try_send(BackendCmd::ConnectOpen(ssid.clone()))
                 .is_err()
             {
-                tracing::warn!(%ssid, "connect command dropped: backend channel full");
+                tracing::warn!(ssid = %ssid.as_str(), "connect command dropped: backend channel full");
                 set_row_connecting(&h2, &ssid, false);
             }
         } else if saved {
@@ -568,7 +586,7 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
                 .try_send(BackendCmd::ConnectSaved(ssid.clone()))
                 .is_err()
             {
-                tracing::warn!(%ssid, "connect-saved command dropped: backend channel full");
+                tracing::warn!(ssid = %ssid.as_str(), "connect-saved command dropped: backend channel full");
                 set_row_connecting(&h2, &ssid, false);
             }
         } else if secured {
@@ -576,17 +594,6 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
                 entry.grab_focus();
             }
             return;
-        } else {
-            mark_connecting(&h2, &ssid, false, false);
-            set_row_connecting(&h2, &ssid, true);
-            if h2
-                .cmd_tx
-                .try_send(BackendCmd::ConnectOpen(ssid.clone()))
-                .is_err()
-            {
-                tracing::warn!(%ssid, "connect command dropped: backend channel full");
-                set_row_connecting(&h2, &ssid, false);
-            }
         }
         h2.sync_focus();
     })
@@ -643,7 +650,7 @@ fn register_pw_fields(h: &UiHandles, ap: &crate::state::Ap, entry: gtk4::Passwor
     update_connect_sensitivity(h, &ap.ssid, true);
 }
 
-fn update_connect_sensitivity(h: &UiHandles, ssid: &str, needs_password: bool) {
+fn update_connect_sensitivity(h: &UiHandles, ssid: &Ssid, needs_password: bool) {
     let ready = !needs_password
         || h.pw_drafts
             .borrow()
@@ -665,7 +672,7 @@ pub(crate) fn ap_row(
     expanded: bool,
     err: Option<String>,
     h: &UiHandles,
-    set_expanded: Rc<dyn Fn(Option<String>)>,
+    set_expanded: Rc<dyn Fn(Option<Ssid>)>,
 ) -> gtk4::ListBoxRow {
     let ActiveInfo {
         iface,
@@ -699,12 +706,12 @@ pub(crate) fn ap_row(
                 w = cur.parent();
             }
         }
-        let is_exp = h2.expanded.borrow().as_deref() == Some(ssid.as_str());
+        let is_exp = h2.expanded.borrow().as_ref() == Some(&ssid);
         se(if is_exp { None } else { Some(ssid.clone()) });
     });
     vbox.add_controller(click);
 
-    let (sig, set_strength) = net_icon_live(ap.strength, ap.secured);
+    let (sig, set_strength) = net_icon_live(ap.strength, ap.security.is_secured());
     hbox.append(&sig);
     h.strength_setters
         .borrow_mut()
@@ -712,7 +719,7 @@ pub(crate) fn ap_row(
 
     let name_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     name_box.set_hexpand(true);
-    let ssid = gtk4::Label::new(Some(&ap.ssid));
+    let ssid = gtk4::Label::new(Some(ap.ssid.as_str()));
     ssid.set_halign(gtk4::Align::Start);
     ssid.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     ssid.set_max_width_chars(SSID_CHARS);
@@ -737,7 +744,7 @@ pub(crate) fn ap_row(
     } else {
         ap.bands
     };
-    let band_label = crate::nm_client::aps::band_label(bands);
+    let band_label = bands.label();
     if !band_label.is_empty() {
         add_chip(&band_label);
     }
@@ -790,14 +797,19 @@ pub(crate) fn ap_row(
             (action.clone(), hbox.clone(), slot.clone()),
         );
         hbox.append(&slot);
-        if expanded && ap.secured {
+        if expanded && ap.security.is_secured() {
             card_actions.append(&action);
         } else {
             hbox.append(&action);
         }
     }
-    if ap.enterprise || ap.wep {
-        add_badge(if ap.enterprise { "enterprise" } else { "WEP" });
+    let cfg_needed = ap.security.is_enterprise() || ap.security.is_wep();
+    if cfg_needed {
+        add_badge(if ap.security.is_enterprise() {
+            "enterprise"
+        } else {
+            "WEP"
+        });
         let cfg = gtk4::Button::with_label("Configure");
         cfg.add_css_class("flat");
         cfg.set_tooltip_text(Some("Open connection settings"));
@@ -822,7 +834,7 @@ pub(crate) fn ap_row(
         chev.set_focusable(false);
         chev.set_focus_on_click(false);
         chev.connect_clicked(move |_| {
-            let is_exp = h2.expanded.borrow().as_deref() == Some(ssid.as_str());
+            let is_exp = h2.expanded.borrow().as_ref() == Some(&ssid);
             se(if is_exp { None } else { Some(ssid.clone()) });
         });
         h.chevrons.borrow_mut().insert(ap.ssid.clone(), chev_img);
@@ -863,7 +875,7 @@ pub(crate) fn ap_row(
         speed_row.append(&up_label);
         details.append(&speed_row);
         *h.speed_labels.borrow_mut() = Some((down_label, up_label));
-    } else if !ap.secured {
+    } else if !ap.security.is_secured() {
         let l = gtk4::Label::new(Some("Open network"));
         l.set_halign(gtk4::Align::Start);
         l.add_css_class("dim-label");
@@ -872,7 +884,7 @@ pub(crate) fn ap_row(
             card_actions.append(&forget_button(ap, h));
         }
         details.append(&card_actions);
-    } else if ap.enterprise || ap.wep {
+    } else if ap.security.is_enterprise() || ap.security.is_wep() {
         if let Some(e) = err.as_deref() {
             let el = gtk4::Label::new(Some(e));
             el.set_halign(gtk4::Align::Start);
@@ -880,7 +892,7 @@ pub(crate) fn ap_row(
             el.set_wrap(true);
             details.append(&el);
         }
-        let hint = if ap.enterprise {
+        let hint = if ap.security.is_enterprise() {
             "Enterprise network — certificates are configured in Network settings"
         } else {
             "WEP network — configure the key in Network settings"
@@ -904,7 +916,7 @@ pub(crate) fn ap_row(
                 .insert(ap.ssid.clone(), el.clone());
             el
         };
-        let show_pw = ap.secured && (!ap.saved || has_err);
+        let show_pw = ap.security.is_secured() && (!ap.saved || has_err);
         if show_pw {
             let entry = password_fields(ap, h, &details, err_label);
             register_pw_fields(h, ap, entry);

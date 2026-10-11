@@ -20,9 +20,12 @@ pub async fn load_wireless_settings(
     conn: &zbus::Connection,
     paths: Vec<OwnedObjectPath>,
 ) -> Vec<(OwnedObjectPath, SettingsMap)> {
-    map_bounded(paths, |path| {
-        let conn = conn.clone();
-        async move { get_settings(&conn, &path).await.map(|m| (path, m)) }
+    map_bounded(paths, {
+        let conn: zbus::Connection = (*conn).clone();
+        move |path| {
+            let conn = conn.clone();
+            async move { get_settings(&conn, &path).await.map(|m| (path, m)) }
+        }
     })
     .await
     .into_iter()
@@ -40,11 +43,16 @@ pub fn is_hotspot_profile(map: &SettingsMap) -> bool {
         .map(|v| matches!(&**v, Value::Str(s) if s.as_str() == "ap"))
         .unwrap_or(false)
 }
-pub fn profile_psk(map: &SettingsMap) -> Option<String> {
-    map.get("802-11-wireless-security")
-        .and_then(|w| w.get("psk"))
+pub fn connection_timestamp(map: &SettingsMap) -> Option<u64> {
+    map.get("connection")
+        .and_then(|c| c.get("timestamp"))
         .and_then(|v| match &**v {
-            Value::Str(s) => Some(s.to_string()),
+            Value::U64(t) => Some(*t),
+            Value::I64(t) => u64::try_from(*t).ok(),
+            Value::U32(t) => Some(*t as u64),
+            Value::I32(t) => u64::try_from(*t).ok(),
+            Value::U16(t) => Some(*t as u64),
+            Value::I16(t) => u64::try_from(*t).ok(),
             _ => None,
         })
 }
@@ -79,14 +87,20 @@ pub async fn hotspot_profile_path(conn: &zbus::Connection) -> Result<Option<Owne
         .find(|(_, m)| is_hotspot_profile(m))
         .map(|(p, _)| p))
 }
-pub async fn delete_all_hotspot_profiles(conn: &zbus::Connection) {
+pub async fn delete_all_hotspot_profiles_except(
+    conn: &zbus::Connection,
+    keep: &zbus::zvariant::OwnedObjectPath,
+) {
     use rusty_network_manager::SettingsConnectionProxy;
     let loaded = load_wireless_settings(conn, wireless_profile_paths(conn).await).await;
     for (path, map) in loaded {
         if !is_hotspot_profile(&map) {
             continue;
         }
-        if let Ok(proxy) = SettingsConnectionProxy::new_from_path(path, conn).await {
+        if path == *keep {
+            continue;
+        }
+        if let Some(proxy) = super::uncached_proxy!(SettingsConnectionProxy, conn, path) {
             let _ = proxy.delete().await;
         }
     }
@@ -152,7 +166,6 @@ mod tests {
         let empty = SettingsMap::new();
         assert_eq!(wireless_ssid(&empty), None);
         assert!(!is_hotspot_profile(&empty));
-        assert_eq!(profile_psk(&empty), None);
         assert_eq!(autoconnect_priority(&empty), 0);
     }
 }

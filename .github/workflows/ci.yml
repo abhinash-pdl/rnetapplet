@@ -8,7 +8,14 @@ on:
 jobs:
   check:
     if: "!contains(github.event.head_commit.message, 'skip ci')"
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     container: archlinux:latest
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +31,14 @@ jobs:
   release:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'skip ci')
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     container: archlinux:latest
     permissions:
       contents: write
@@ -54,7 +68,8 @@ jobs:
         if: steps.ver.outputs.bump == 'true'
         run: |
           VER="${{ steps.ver.outputs.version }}"
-          DIR="rnetapplet-$VER-x86_64-linux"
+          ARCH="${{ matrix.arch }}"
+          DIR="rnetapplet-$VER-$ARCH-linux"
           rm -rf "$DIR" "$DIR.tar.gz" "$DIR.tar.gz.sha256"
           mkdir "$DIR"
           install -Dm755 target/release/rnetapplet "$DIR/rnetapplet"
@@ -73,8 +88,8 @@ jobs:
           name: rnetapplet ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           files: |
-            rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz
-            rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz.sha256
+            rnetapplet-${{ steps.ver.outputs.version }}-${{ matrix.arch }}-linux.tar.gz
+            rnetapplet-${{ steps.ver.outputs.version }}-${{ matrix.arch }}-linux.tar.gz.sha256
       - name: point install script at the new release
         if: steps.ver.outputs.bump == 'true'
         env:
@@ -94,7 +109,8 @@ jobs:
           ver, sha = sys.argv[1], sys.argv[2]
           s = open("README.md").read()
           s = re.sub(r"releases/download/v[0-9.]+/", f"releases/download/v{ver}/", s)
-          s = re.sub(r"rnetapplet-[0-9.]+-x86_64-linux", f"rnetapplet-{ver}-x86_64-linux", s)
+           s = re.sub(r"rnetapplet-[0-9.]+-x86_64-linux", f"rnetapplet-{ver}-x86_64-linux", s)
+           s = re.sub(r"rnetapplet-[0-9.]+-aarch64-linux", f"rnetapplet-{ver}-aarch64-linux", s)
           s = re.sub(r'echo "[0-9a-f]{64}  rnetapplet\.tar\.gz"', f'echo "{sha}  rnetapplet.tar.gz"', s)
           open("README.md", "w").write(s)
           EOF
