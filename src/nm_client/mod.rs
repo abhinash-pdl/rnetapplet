@@ -6,9 +6,9 @@ pub mod known;
 pub mod profiles;
 pub mod radio;
 pub mod signals;
-use crate::state::{Ap, Model, VpnConnection};
+use self::aps::{Bands, Security};
+use crate::state::{Ap, Model, Ssid, VpnConnection};
 use anyhow::{Context, Result};
-use futures::StreamExt as _;
 use rusty_network_manager::{ActiveProxy, DeviceProxy, NetworkManagerProxy, WirelessProxy};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +17,7 @@ use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 pub const NM_DEVICE_TYPE_WIFI: u32 = 2;
 const FANOUT: usize = 24;
-const SCAN_POLL: Duration = Duration::from_millis(250);
+const SCAN_POLL: Duration = Duration::from_millis(500);
 const PROFILE_TTL: Duration = Duration::from_secs(30);
 const CONN_BAD_GRACE: Duration = Duration::from_secs(5);
 pub const SCAN_WAIT: Duration = Duration::from_secs(12);
@@ -25,9 +25,8 @@ const STALE_HORIZON: Duration = Duration::from_secs(120);
 
 pub const DBUS_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
-const STALE_TOLERANCE_VISIBLE: u64 = 12;
-
-const STALE_TOLERANCE_HIDDEN: u64 = 86_400;
+const STALE_TOLERANCE_SECS: u64 = 12;
+const NM_SCAN_MS_PER_SEC: u64 = 1000;
 
 pub fn boottime_secs() -> Option<u64> {
     let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
@@ -39,18 +38,70 @@ pub fn is_ghost(last_seen: u64, scan_completed: u64, tolerance: u64) -> bool {
     last_seen > 0 && scan_completed > 0 && last_seen.saturating_add(tolerance) < scan_completed
 }
 const AP_INTERFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
+macro_rules! uncached_proxy {
+    ($proxy:ty, $conn:expr, $path:expr) => {{
+        match <$proxy>::builder($conn).path($path) {
+            Ok(builder) => {
+                match builder
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .build()
+                    .await
+                {
+                    Ok(proxy) => Some(proxy),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }};
+}
+pub(crate) use uncached_proxy;
 pub async fn map_bounded<I, T, F, Fut, R>(items: I, f: F) -> Vec<R>
 where
     I: IntoIterator<Item = T>,
-    F: Fn(T) -> Fut + Clone,
-    Fut: std::future::Future<Output = R>,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+    T: Send + 'static,
+    R: Send + 'static,
 {
-    futures::stream::iter(items.into_iter().map(f))
-        .buffer_unordered(FANOUT)
-        .collect()
-        .await
+    let mut out = Vec::new();
+    let mut batch: Vec<T> = Vec::with_capacity(FANOUT);
+    for item in items {
+        batch.push(item);
+        if batch.len() < FANOUT {
+            continue;
+        }
+        drain_batch(&mut batch, &f, &mut out).await;
+    }
+    if !batch.is_empty() {
+        drain_batch(&mut batch, &f, &mut out).await;
+    }
+    out
 }
-pub type ProfileIndex = (Vec<VpnConnection>, std::collections::HashMap<String, i32>);
+async fn drain_batch<T, F, Fut, R>(batch: &mut Vec<T>, f: &F, out: &mut Vec<R>)
+where
+    F: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = R> + Send + 'static,
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for item in batch.drain(..) {
+        let task = f.clone();
+        set.spawn(async move { task(item).await });
+    }
+    while let Some(done) = set.join_next().await {
+        match done {
+            Ok(value) => out.push(value),
+            Err(e) => tracing::warn!("bounded task failed: {e}"),
+        }
+    }
+}
+pub type ProfileIndex = (
+    Vec<VpnConnection>,
+    std::collections::HashMap<String, i32>,
+    std::collections::HashMap<String, u64>,
+);
 
 pub struct NmClient {
     system: Connection,
@@ -88,27 +139,30 @@ impl NmClient {
     pub fn popup_visible(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.popup_visible.clone()
     }
-
-    pub async fn has_connected(&self, ssid: &str) -> bool {
-        self.connected_once.read().await.contains(ssid)
-    }
     pub async fn mark_connected(&self, ssid: &str) {
-        let mut set = self.connected_once.write().await;
-        if set.insert(ssid.to_string()) {
-            known::save(&set);
-            tracing::info!(ssid, "network marked as previously connected");
-        }
+        let snapshot = {
+            let mut set = self.connected_once.write().await;
+            if !set.insert(ssid.to_string()) {
+                return;
+            }
+            set.clone()
+        };
+        let _ = tokio::task::spawn_blocking(move || known::save(&snapshot))
+            .await
+            .inspect_err(|e| tracing::warn!("connected-list save task panicked: {e:#}"));
+        tracing::info!(ssid, "network marked as previously connected");
     }
     pub async fn version(&self) -> Result<String> {
         Ok(self.nm.version().await?)
     }
     pub async fn wifi_device_path(&self) -> Result<Option<OwnedObjectPath>> {
         let devices = self.nm.get_devices().await?;
-        let types = map_bounded(devices, |path| {
-            let conn = self.system.clone();
+        let conn = self.system.clone();
+        let types = map_bounded(devices, move |path| {
+            let conn = conn.clone();
             async move {
-                let dev = DeviceProxy::new_from_path(path.clone(), &conn).await?;
-                Ok::<_, zbus::Error>((path, dev.device_type().await.unwrap_or(0)))
+                let dev = uncached_proxy!(DeviceProxy, &conn, path.clone())?;
+                Some((path, dev.device_type().await.unwrap_or(0)))
             }
         })
         .await;
@@ -125,7 +179,9 @@ impl NmClient {
     ) -> Result<bool> {
         let wifi = WirelessProxy::new_from_path(wifi_path.clone(), self.system_conn()).await?;
         let before = wifi.last_scan().await.unwrap_or(0);
-        let _ = wifi.request_scan(std::collections::HashMap::new()).await;
+        if let Err(e) = wifi.request_scan(std::collections::HashMap::new()).await {
+            tracing::warn!("NM rejected scan request: {e:#}");
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let now = wifi.last_scan().await.unwrap_or(0);
@@ -142,14 +198,26 @@ impl NmClient {
         }
     }
     pub async fn list_aps(&self, wifi_path: &OwnedObjectPath) -> Result<Vec<Ap>> {
-        let wifi = WirelessProxy::new_from_path(wifi_path.clone(), self.system_conn()).await?;
+        let Some(wifi) = uncached_proxy!(WirelessProxy, self.system_conn(), wifi_path.clone())
+        else {
+            anyhow::bail!("could not open the Wi-Fi device");
+        };
+        if let Ok(stamp) = wifi.last_scan().await
+            && stamp > 0
+        {
+            self.scan_completed.fetch_max(
+                stamp as u64 / NM_SCAN_MS_PER_SEC,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let ap_paths = wifi.get_all_access_points().await.unwrap_or_default();
         if ap_paths.is_empty() {
             return Ok(Vec::new());
         }
         let n_paths = ap_paths.len();
-        let rows = map_bounded(ap_paths, |path| {
-            let conn = self.system.clone();
+        let conn = self.system.clone();
+        let rows = map_bounded(ap_paths, move |path| {
+            let conn = conn.clone();
             async move { ap_props(&conn, &path).await }
         })
         .await;
@@ -159,17 +227,14 @@ impl NmClient {
                 .map(|now| now.saturating_sub(completed) <= STALE_HORIZON.as_secs())
                 .unwrap_or(false);
         tracing::debug!(completed, fresh, "stale filter state");
-        let (_vpn_index, saved) = self.profile_index().await;
+        let index = self.profile_index().await;
+        let saved = &index.1;
         let priority_of = |ssid: &str| saved.get(ssid).copied().unwrap_or(0);
+        let connected = self.connected_once.read().await.clone();
         let mut by_ssid: std::collections::HashMap<String, Ap> = std::collections::HashMap::new();
         for props in rows.into_iter().flatten() {
             let Some(ssid) = props.ssid else { continue };
-            let tolerance = if self.popup_visible.load(Ordering::Relaxed) {
-                STALE_TOLERANCE_VISIBLE
-            } else {
-                STALE_TOLERANCE_HIDDEN
-            };
-            if fresh && is_ghost(props.last_seen, completed, tolerance) {
+            if fresh && is_ghost(props.last_seen, completed, STALE_TOLERANCE_SECS) {
                 tracing::debug!(
                     ssid = %ssid,
                     last_seen = props.last_seen,
@@ -185,12 +250,10 @@ impl NmClient {
                         slot.strength = props.strength;
                         slot.freq_mhz = props.freq_mhz;
                     }
-                    slot.bands |= aps::band_bit(props.freq_mhz);
-                    slot.secured = props.secured;
-                    slot.enterprise = props.enterprise;
-                    slot.wep = props.wep;
+                    slot.bands |= Bands::from_freq(props.freq_mhz);
+                    slot.security = slot.security.stricter(props.security);
                     slot.saved = is_saved;
-                    slot.known = is_saved && self.has_connected(&ssid).await;
+                    slot.known = is_saved && connected.contains(&ssid);
                     slot.priority = priority_of(&ssid);
                 }
                 None => {
@@ -198,15 +261,13 @@ impl NmClient {
                         ssid.clone(),
                         Ap {
                             saved: is_saved,
-                            known: is_saved && self.has_connected(&ssid).await,
+                            known: is_saved && connected.contains(&ssid),
                             priority: priority_of(&ssid),
-                            bands: aps::band_bit(props.freq_mhz),
-                            ssid,
+                            bands: Bands::from_freq(props.freq_mhz),
+                            ssid: ssid.clone().into(),
                             strength: props.strength,
                             freq_mhz: props.freq_mhz,
-                            secured: props.secured,
-                            enterprise: props.enterprise,
-                            wep: props.wep,
+                            security: props.security,
                         },
                     );
                 }
@@ -217,53 +278,44 @@ impl NmClient {
         crate::state::sort_aps(&mut aps);
         Ok(aps)
     }
-    pub async fn autoconnect_candidates(&self) -> Vec<(String, i32)> {
-        let (_, saved) = self.profile_index_fresh().await;
-        let mut out: Vec<(String, i32)> = saved.into_iter().collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out
-    }
     pub async fn drop_profile_cache(&self) {
         *self.profiles.lock().await = None;
     }
-    pub async fn profile_index(&self) -> ProfileIndex {
+    pub async fn profile_index(&self) -> Arc<ProfileIndex> {
+        let mut cached = self.profiles.lock().await;
+        if let Some((at, data)) = cached.as_ref()
+            && at.elapsed() < PROFILE_TTL
         {
-            let cached = self.profiles.lock().await;
-            if let Some((at, data)) = cached.as_ref()
-                && at.elapsed() < PROFILE_TTL
-            {
-                return data.as_ref().clone();
-            }
+            return data.clone();
         }
         let fresh = self.profile_index_uncached().await;
-        *self.profiles.lock().await = Some((Instant::now(), Arc::new(fresh.clone())));
-        fresh
-    }
-    pub async fn profile_index_fresh(&self) -> ProfileIndex {
-        let fresh = self.profile_index_uncached().await;
-        *self.profiles.lock().await = Some((Instant::now(), Arc::new(fresh.clone())));
+        let fresh = Arc::new(fresh);
+        *cached = Some((Instant::now(), fresh.clone()));
         fresh
     }
     async fn profile_index_uncached(&self) -> ProfileIndex {
         let Ok(settings) = rusty_network_manager::SettingsProxy::new(self.system_conn()).await
         else {
-            return (Vec::new(), Default::default());
+            return (Vec::new(), Default::default(), Default::default());
         };
         let Ok(paths) = settings.list_connections().await else {
-            return (Vec::new(), Default::default());
+            return (Vec::new(), Default::default(), Default::default());
         };
-        let details = map_bounded(paths, |path| {
-            let conn = self.system.clone();
+        let conn = self.system.clone();
+        let details = map_bounded(paths, move |path| {
+            let conn = conn.clone();
             async move {
-                let map = get_settings(&conn, &path).await;
-                (path, map)
+                let (map, unsaved) =
+                    tokio::join!(get_settings(&conn, &path), profile_unsaved(&conn, &path));
+                (path, map, unsaved)
             }
         })
         .await;
         let active = self.active_vpn_ids().await;
         let mut vpns = Vec::new();
         let mut saved = std::collections::HashMap::new();
-        for (path, map) in details {
+        let mut timestamps = std::collections::HashMap::new();
+        for (path, map, unsaved) in details {
             let Some(map) = map else { continue };
             let kind = map
                 .get("connection")
@@ -293,26 +345,38 @@ impl NmClient {
                     if profiles::is_hotspot_profile(&map) {
                         continue;
                     }
-                    if profile_unsaved(&self.system, &path).await {
+                    if unsaved {
                         continue;
                     }
                     if let Some(ssid) = profiles::wireless_ssid(&map) {
-                        saved.insert(ssid, profiles::autoconnect_priority(&map));
+                        saved.insert(ssid.clone(), profiles::autoconnect_priority(&map));
+                        if let Some(ts) = profiles::connection_timestamp(&map) {
+                            timestamps.insert(ssid, ts);
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        (vpns, saved)
+        (vpns, saved, timestamps)
     }
     pub async fn active_vpn_ids(&self) -> std::collections::HashSet<String> {
         let Ok(actives) = self.nm.active_connections().await else {
             return Default::default();
         };
-        map_bounded(actives, |path| {
-            let conn = self.system.clone();
+        let conn = self.system.clone();
+        map_bounded(actives, move |path| {
+            let conn = conn.clone();
             async move {
-                let Ok(proxy) = ActiveProxy::new_from_path(path, &conn).await else {
+                let builder = ActiveProxy::builder(&conn);
+                let Ok(builder) = builder.path(path) else {
+                    return None;
+                };
+                let Ok(proxy) = builder
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .build()
+                    .await
+                else {
                     return None;
                 };
                 if !matches!(proxy.type_().await.as_deref(), Ok("vpn") | Ok("wireguard")) {
@@ -326,59 +390,58 @@ impl NmClient {
         .flatten()
         .collect()
     }
-    pub async fn active_ssid(&self) -> Result<Option<String>> {
-        let actives = self.nm.active_connections().await.unwrap_or_default();
-        let ids = map_bounded(actives, |path| {
-            let conn = self.system.clone();
-            async move {
-                let Ok(proxy) = ActiveProxy::new_from_path(path, &conn).await else {
-                    return None;
-                };
-                if proxy.state().await.unwrap_or(0) != 2 {
-                    return None;
-                }
-                if proxy.type_().await.as_deref() != Ok("802-11-wireless") {
-                    return None;
-                }
-                proxy.id().await.ok()
-            }
-        })
-        .await;
-        Ok(ids.into_iter().flatten().next())
+    pub async fn active_ssid(&self) -> Result<Option<Ssid>> {
+        Ok(self
+            .active_wifi_snapshot()
+            .await
+            .map(|(_, ssid)| ssid.into()))
     }
-    pub async fn activating_ssid(&self) -> Result<Option<String>> {
+    pub async fn activating_ssid(&self) -> Result<Option<Ssid>> {
         let actives = self.nm.active_connections().await.unwrap_or_default();
-        let ids = map_bounded(actives, |path| {
-            let conn = self.system.clone();
+        let conn = self.system.clone();
+        let rows = map_bounded(actives, move |path| {
+            let conn = conn.clone();
             async move {
-                let Ok(proxy) = ActiveProxy::new_from_path(path, &conn).await else {
-                    return None;
-                };
+                let proxy = uncached_proxy!(ActiveProxy, &conn, path)?;
                 if proxy.state().await.unwrap_or(0) != 1 {
                     return None;
                 }
                 if proxy.type_().await.as_deref() != Ok("802-11-wireless") {
                     return None;
                 }
-                proxy.id().await.ok()
+                let Ok(profile) = proxy.connection().await else {
+                    return None;
+                };
+                let map = get_settings(&conn, &profile).await?;
+                profiles::wireless_ssid(&map)
             }
         })
         .await;
-        Ok(ids.into_iter().flatten().next())
+        Ok(rows.into_iter().flatten().next().map(Ssid::from))
     }
     pub async fn vpn_connections(&self) -> Result<Vec<VpnConnection>> {
-        Ok(self.profile_index().await.0)
+        Ok(self.profile_index().await.0.clone())
     }
     pub async fn refresh_model(&self) -> Result<Model> {
         let (wifi_enabled, networking_enabled) =
-            futures::try_join!(self.nm.wireless_enabled(), self.nm.networking_enabled())
-                .unwrap_or((true, true));
-        let (connectivity, connectivity_check, primary_type) = futures::try_join!(
+            match tokio::try_join!(self.nm.wireless_enabled(), self.nm.networking_enabled()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("NM radio state query failed: {e:#}");
+                    (true, true)
+                }
+            };
+        let (connectivity, connectivity_check, primary_type) = match tokio::try_join!(
             self.nm.connectivity(),
             self.nm.connectivity_check_enabled(),
             self.nm.primary_connection_type()
-        )
-        .unwrap_or((0, false, String::new()));
+        ) {
+            Ok(triple) => triple,
+            Err(e) => {
+                tracing::warn!("NM connectivity query failed: {e:#}");
+                (0, false, String::new())
+            }
+        };
         let wifi_path = self.wifi_device_path().await?;
         let mut aps = Vec::new();
         if let Some(ref path) = wifi_path {
@@ -387,10 +450,22 @@ impl NmClient {
         let mut active_ssid = self.active_ssid().await.unwrap_or(None);
         let activating_ssid = self.activating_ssid().await.unwrap_or(None);
         let vpn_connections = self.vpn_connections().await.unwrap_or_default();
-        let (_, saved_profiles) = self.profile_index().await;
-        let mut saved_ssids: Vec<String> = saved_profiles.into_keys().collect();
+        let index = self.profile_index().await;
+        let saved_profiles = &index.1;
+        let timestamps = &index.2;
+        let mut saved_ssids: Vec<Ssid> = saved_profiles
+            .keys()
+            .map(|s| Ssid::from(s.as_str()))
+            .collect();
         saved_ssids.sort();
-        tracing::debug!(count = saved_ssids.len(), ?saved_ssids, "saved profiles");
+        tracing::debug!(count = saved_ssids.len(), "saved profiles");
+        let visible_ssids: std::collections::HashSet<Ssid> =
+            aps.iter().map(|ap| ap.ssid.clone()).collect();
+        let last_good = saved_ssids
+            .iter()
+            .filter(|ssid| visible_ssids.contains(*ssid))
+            .max_by_key(|ssid| timestamps.get(ssid.as_str()).copied().unwrap_or(0))
+            .cloned();
         let net = details::active_details(self, wifi_path.clone()).await;
         let wired = details::wired_status(self).await;
         let hotspot = details::hotspot_status(self).await.unwrap_or(None);
@@ -410,7 +485,6 @@ impl NmClient {
             active_gateway: net.gateway,
             active_dns: net.dns,
             active_freq_mhz: net.freq_mhz,
-            saved_ssids: saved_ssids.clone().into(),
             wired,
             hotspot,
             wifi_enabled,
@@ -430,6 +504,7 @@ impl NmClient {
             },
             primary_wired: primary_type == "802-3-ethernet",
             vpn_connections: vpn_connections.into(),
+            last_good,
         })
     }
 }
@@ -437,9 +512,7 @@ struct ApProps {
     ssid: Option<String>,
     strength: u8,
     freq_mhz: Option<u32>,
-    secured: bool,
-    enterprise: bool,
-    wep: bool,
+    security: Security,
     last_seen: u64,
 }
 async fn ap_props(conn: &Connection, path: &OwnedObjectPath) -> Option<ApProps> {
@@ -450,6 +523,7 @@ async fn ap_props(conn: &Connection, path: &OwnedObjectPath) -> Option<ApProps> 
         .ok()?
         .path(path.clone())
         .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
         .ok()?;
@@ -477,9 +551,7 @@ async fn ap_props(conn: &Connection, path: &OwnedObjectPath) -> Option<ApProps> 
             let f = u32_of("Frequency");
             if f > 0 { Some(f) } else { None }
         },
-        secured: aps::is_secured(wpa, rsn) || aps::is_wep_only(flags, wpa, rsn),
-        enterprise: aps::is_enterprise(wpa, rsn),
-        wep: aps::is_wep_only(flags, wpa, rsn),
+        security: aps::classify_security(wpa, rsn, flags),
         last_seen,
     })
 }
@@ -497,21 +569,23 @@ pub(crate) async fn get_settings(
     path: &OwnedObjectPath,
 ) -> Option<std::collections::HashMap<String, std::collections::HashMap<String, OwnedValue>>> {
     use rusty_network_manager::SettingsConnectionProxy;
-    let proxy = SettingsConnectionProxy::new_from_path(path.clone(), conn)
-        .await
-        .ok()?;
+    let proxy = uncached_proxy!(SettingsConnectionProxy, conn, path.clone())?;
     proxy.get_settings().await.ok()
 }
 pub(crate) async fn profile_unsaved(conn: &Connection, path: &OwnedObjectPath) -> bool {
     use zbus::fdo::PropertiesProxy;
     use zbus::names::InterfaceName;
-    let props = PropertiesProxy::builder(conn)
+    let Ok(builder) = PropertiesProxy::builder(conn)
         .destination("org.freedesktop.NetworkManager")
-        .and_then(|b| b.path(path.clone()));
-    let Ok(props) = props else {
+        .and_then(|b| b.path(path.clone()))
+    else {
         return false;
     };
-    let Ok(props) = props.build().await else {
+    let Ok(props) = builder
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+    else {
         return false;
     };
     let Ok(iface) = InterfaceName::try_from("org.freedesktop.NetworkManager.Settings.Connection")
@@ -540,12 +614,11 @@ pub(crate) async fn active_hotspot_profile(
     use rusty_network_manager::{ActiveProxy, NetworkManagerProxy};
     let nm = NetworkManagerProxy::new(conn).await?;
     let actives = nm.active_connections().await.unwrap_or_default();
-    let wifi = map_bounded(actives, |path| {
+    let conn: Connection = (*conn).clone();
+    let wifi = map_bounded(actives, move |path| {
         let conn = conn.clone();
         async move {
-            let Ok(proxy) = ActiveProxy::new_from_path(path.clone(), &conn).await else {
-                return None;
-            };
+            let proxy = uncached_proxy!(ActiveProxy, &conn, path.clone())?;
             if proxy.type_().await.as_deref() != Ok("802-11-wireless") {
                 return None;
             }
@@ -572,7 +645,7 @@ pub(crate) async fn active_hotspot_profile(
 }
 pub(crate) async fn active_conn_is_hotspot(conn: &Connection, path: &OwnedObjectPath) -> bool {
     use rusty_network_manager::ActiveProxy;
-    let Ok(proxy) = ActiveProxy::new_from_path(path.clone(), conn).await else {
+    let Some(proxy) = uncached_proxy!(ActiveProxy, conn, path.clone()) else {
         return false;
     };
     if proxy.type_().await.as_deref() != Ok("802-11-wireless") {

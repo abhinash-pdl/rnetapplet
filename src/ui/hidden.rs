@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use super::list::{refresh_list, request_rebuild};
 use super::row::{action_button_with, mark_connecting, section_label};
 use super::state::UiHandles;
-use crate::state::BackendCmd;
+use crate::state::{BackendCmd, Ssid};
 
 pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -66,7 +66,7 @@ pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
             let Some(pass_entry) = pass_w.upgrade() else {
                 return;
             };
-            let ssid = ssid_entry.text().trim().to_string();
+            let ssid = Ssid::from(ssid_entry.text().trim().to_string());
             if ssid.is_empty() {
                 *h.hidden_error.borrow_mut() = Some("Enter the network name".into());
                 request_rebuild(&h);
@@ -81,7 +81,10 @@ pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
             h.hidden_error.borrow_mut().take();
             collapse_hidden(&h);
             mark_connecting(&h, &ssid, !psk.is_empty(), false);
-            let _ = h.cmd_tx.try_send(BackendCmd::ConnectHidden { ssid, psk });
+            let _ = h.cmd_tx.try_send(BackendCmd::ConnectHidden {
+                ssid,
+                psk: psk.into(),
+            });
         }
     });
 

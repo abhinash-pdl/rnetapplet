@@ -49,7 +49,7 @@ pub(crate) fn vpn_row(vpn: &VpnConnection, h: &UiHandles) -> gtk4::ListBoxRow {
     hbox.append(&btn);
     vbox.append(&hbox);
 
-    if let Some(err) = h.errors.borrow().get(&vpn.id) {
+    if let Some(err) = h.errors.borrow().get(vpn.id.as_str()) {
         let el = gtk4::Label::new(Some(err));
         el.set_halign(gtk4::Align::Start);
         el.add_css_class("error");

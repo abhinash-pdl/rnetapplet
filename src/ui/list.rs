@@ -8,26 +8,21 @@ use super::hotspot::{ensure_hotspot_card, hotspot_shown};
 use super::row::{ActiveInfo, ap_row, expander, section_label, wired_row};
 use super::state::{UiHandles, structural_change};
 use super::vpn::vpn_row;
-use crate::state::{Ap, Model};
-
-pub(crate) const AP_MISS_THRESHOLD: u8 = 3;
+use crate::state::{Ap, Model, Ssid};
 
 pub(crate) fn merge_ap_sets(
     current: &[Ap],
     fresh: &[Ap],
     active: Option<&str>,
-    misses: &mut HashMap<String, u8>,
-    known: &HashMap<String, u8>,
+    known: &HashMap<Ssid, u8>,
 ) -> Vec<Ap> {
     if current.is_empty() || fresh.is_empty() {
-        misses.clear();
         return fresh.to_vec();
     }
     let fresh_set: HashSet<&str> = fresh.iter().map(|a| a.ssid.as_str()).collect();
     let mut out: Vec<Ap> = fresh.to_vec();
     for ap in current {
         if fresh_set.contains(ap.ssid.as_str()) {
-            misses.remove(&ap.ssid);
             continue;
         }
         if Some(ap.ssid.as_str()) == active {
@@ -36,18 +31,6 @@ pub(crate) fn merge_ap_sets(
                 kept.strength = *s;
             }
             out.push(kept);
-            continue;
-        }
-        let n = misses.get(&ap.ssid).copied().unwrap_or(0) + 1;
-        if n < AP_MISS_THRESHOLD {
-            misses.insert(ap.ssid.clone(), n);
-            let mut kept = ap.clone();
-            if let Some(s) = known.get(&ap.ssid) {
-                kept.strength = *s;
-            }
-            out.push(kept);
-        } else {
-            misses.remove(&ap.ssid);
         }
     }
     crate::state::sort_aps(&mut out);
@@ -107,12 +90,12 @@ pub(crate) fn update_strengths(h: &UiHandles, m: &Model) {
     }
 }
 
-pub(crate) fn reorder_rows(h: &UiHandles, wanted: &[String]) -> bool {
+pub(crate) fn reorder_rows(h: &UiHandles, wanted: &[Ssid]) -> bool {
     let rows = h.rows.borrow();
     if rows.is_empty() {
         return false;
     }
-    let owner = |w: &gtk4::Widget| -> Option<String> {
+    let owner = |w: &gtk4::Widget| -> Option<Ssid> {
         rows.iter()
             .find(|(_, r)| r.upcast_ref::<gtk4::Widget>() == w)
             .map(|(s, _)| s.clone())
@@ -123,7 +106,7 @@ pub(crate) fn reorder_rows(h: &UiHandles, wanted: &[String]) -> bool {
         child = c.next_sibling();
         children.push(c.upcast());
     }
-    let slots: Vec<(usize, String)> = children
+    let slots: Vec<(usize, Ssid)> = children
         .iter()
         .enumerate()
         .filter_map(|(i, w)| owner(w).map(|s| (i, s)))
@@ -134,7 +117,7 @@ pub(crate) fn reorder_rows(h: &UiHandles, wanted: &[String]) -> bool {
     if slots
         .iter()
         .map(|(_, s)| s.as_str())
-        .eq(wanted.iter().map(String::as_str))
+        .eq(wanted.iter().map(Ssid::as_str))
     {
         return false;
     }
@@ -162,10 +145,10 @@ pub(crate) fn reorder_rows(h: &UiHandles, wanted: &[String]) -> bool {
     true
 }
 
-fn wanted_order(h: &UiHandles, m: &Model) -> Vec<String> {
+fn wanted_order(h: &UiHandles, m: &Model) -> Vec<Ssid> {
     let q = h.query.borrow().clone();
     let v = visible(m, &q);
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<Ssid> = Vec::new();
     if let Some(ap) = v.connected {
         out.push(ap.ssid.clone());
     }
@@ -175,6 +158,11 @@ fn wanted_order(h: &UiHandles, m: &Model) -> Vec<String> {
 
 fn ingest(h: &UiHandles, m: Arc<Model>) {
     h.prune_drafts();
+    if let Some(active) = m.active_ssid.as_ref() {
+        h.connecting.borrow_mut().remove(active);
+        h.pw_attempt.borrow_mut().remove(active);
+        h.unsaved_attempt.borrow_mut().remove(active);
+    }
     for ap in m.aps.iter() {
         h.last_strengths
             .borrow_mut()
@@ -186,19 +174,22 @@ fn ingest(h: &UiHandles, m: Arc<Model>) {
             || m.networking_enabled != cur.networking_enabled
             || m.nm_online != cur.nm_online;
         if radio_changed {
-            h.ap_misses.borrow_mut().clear();
             m.aps.to_vec()
         } else {
             merge_ap_sets(
                 &cur.aps,
                 &m.aps,
                 cur.active_ssid.as_deref(),
-                &mut h.ap_misses.borrow_mut(),
                 &h.last_strengths.borrow(),
             )
         }
     };
     let live: HashSet<&str> = merged.iter().map(|a| a.ssid.as_str()).collect();
+    tracing::info!(
+        aps = merged.len(),
+        active = ?m.active_ssid.as_deref(),
+        "ui ingested model"
+    );
     h.last_strengths
         .borrow_mut()
         .retain(|ssid, _| live.contains(ssid.as_str()));
@@ -310,7 +301,6 @@ pub(crate) fn teardown(h: &UiHandles) {
     h.hotspot_expanded.set(false);
     h.hotspot_closing.set(false);
     h.hidden_entries.borrow_mut().clear();
-    h.ap_misses.borrow_mut().clear();
     h.pw_hovered.set(false);
     h.was_editing.set(false);
     h.focus_ssid.borrow_mut().take();
@@ -329,12 +319,17 @@ pub(crate) fn schedule_teardown(h: &UiHandles) {
 
 pub(crate) fn restore_focus(h: &UiHandles) {
     let target = h.focus_ssid.borrow().clone();
-    let Some(entry) = target
-        .as_ref()
-        .and_then(|s| h.pw_entries.borrow().get(s).cloned())
-    else {
+    let (Some(ssid), Some(entry)) = (
+        target.as_ref(),
+        target
+            .as_ref()
+            .and_then(|s| h.pw_entries.borrow().get(s).cloned()),
+    ) else {
         return;
     };
+    if !h.should_grab_password_focus(ssid) {
+        return;
+    }
 
     if entry.is_mapped() {
         entry.grab_focus();
@@ -448,16 +443,14 @@ pub(crate) fn refresh_list(h: &UiHandles) {
             .or_else(|| h.last_strengths.borrow().get(ssid).copied())
             .unwrap_or(0);
         let synthetic = Ap {
-            ssid: ssid.to_string(),
+            ssid: ssid.into(),
             strength,
-            secured: true,
-            enterprise: false,
-            wep: false,
+            security: crate::nm_client::aps::Security::Wpa,
             freq_mhz: None,
             bands: v
                 .connected
-                .map(|ap| crate::nm_client::aps::band_bit(ap.freq_mhz))
-                .unwrap_or(0),
+                .map(|ap| ap.bands)
+                .unwrap_or(crate::nm_client::aps::Bands::NONE),
             saved: true,
             known: true,
             priority: 0,
@@ -483,7 +476,7 @@ pub(crate) fn refresh_list(h: &UiHandles) {
         );
         h.rows
             .borrow_mut()
-            .insert(ssid.to_string(), connected_row.clone());
+            .insert(ssid.into(), connected_row.clone());
         h.list.append(&connected_row);
     }
 
@@ -597,16 +590,15 @@ pub(crate) fn refresh_list(h: &UiHandles) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nm_client::aps::{Bands, Security};
 
     fn ap(ssid: &str, strength: u8) -> Ap {
         Ap {
             ssid: ssid.into(),
             strength,
-            secured: true,
-            enterprise: false,
-            wep: false,
+            security: Security::Wpa,
             freq_mhz: None,
-            bands: 0,
+            bands: Bands::NONE,
             saved: false,
             known: false,
             priority: 0,
@@ -640,8 +632,8 @@ mod tests {
         assert!(std::ptr::eq(out[0], &aps[0]));
     }
 
-    fn merge_ctx() -> (HashMap<String, u8>, HashMap<String, u8>) {
-        (HashMap::new(), HashMap::new())
+    fn known() -> HashMap<Ssid, u8> {
+        HashMap::new()
     }
 
     fn ssids(aps: &[Ap]) -> Vec<&str> {
@@ -652,9 +644,8 @@ mod tests {
     fn merge_puts_the_stronger_network_first() {
         let current = vec![ap("Home", 60), ap("Cafe", 40)];
         let loud = vec![ap("Home", 30), ap("Cafe", 90)];
-        let (mut misses, known) = merge_ctx();
         assert_eq!(
-            ssids(&merge_ap_sets(&current, &loud, None, &mut misses, &known)),
+            ssids(&merge_ap_sets(&current, &loud, None, &known())),
             ["Cafe", "Home"]
         );
     }
@@ -663,50 +654,46 @@ mod tests {
     fn merge_updates_strengths_and_adds_new_immediately() {
         let current = vec![ap("Home", 60), ap("Cafe", 40)];
         let fresh = vec![ap("Home", 80), ap("Work", 50)];
-        let (mut misses, known) = merge_ctx();
-        let mut known = known;
+        let mut known = known();
         known.insert("Home".into(), 80);
-        let out = merge_ap_sets(&current, &fresh, None, &mut misses, &known);
+        let out = merge_ap_sets(&current, &fresh, None, &known);
 
-        assert_eq!(ssids(&out), vec!["Home", "Work", "Cafe"]);
+        assert_eq!(ssids(&out), vec!["Home", "Work"]);
         let home = out.iter().find(|a| a.ssid == "Home").expect("Home kept");
         assert_eq!(home.strength, 80);
     }
 
     #[test]
-    fn merge_forgives_fewer_absences_than_the_threshold() {
+    fn merge_drops_absent_immediately() {
         let current = vec![ap("Home", 60), ap("Cafe", 40)];
         let fresh = vec![ap("Home", 60)];
-        let (mut misses, known) = merge_ctx();
-        for _ in 0..AP_MISS_THRESHOLD - 1 {
-            let out = merge_ap_sets(&current, &fresh, None, &mut misses, &known);
-            assert!(ssids(&out).contains(&"Cafe"));
-        }
-        let out = merge_ap_sets(&current, &fresh, None, &mut misses, &known);
+        let out = merge_ap_sets(&current, &fresh, None, &known());
         assert!(!ssids(&out).contains(&"Cafe"));
+    }
+
+    #[test]
+    fn merge_drops_absent_immediately_but_keeps_active() {
+        let current = vec![ap("Home", 60), ap("Cafe", 40), ap("Gone", 30)];
+        let fresh = vec![ap("Home", 60), ap("Cafe", 40)];
+        let out = merge_ap_sets(&current, &fresh, Some("Cafe"), &known());
+        assert_eq!(ssids(&out), vec!["Home", "Cafe"]);
     }
 
     #[test]
     fn merge_never_forgets_the_connected_network() {
         let current = vec![ap("Home", 60), ap("Cafe", 40)];
         let fresh = vec![ap("Home", 60)];
-        let (mut misses, known) = merge_ctx();
         for _ in 0..10 {
-            let out = merge_ap_sets(&current, &fresh, Some("Cafe"), &mut misses, &known);
+            let out = merge_ap_sets(&current, &fresh, Some("Cafe"), &known());
             assert!(ssids(&out).contains(&"Cafe"));
         }
     }
 
     #[test]
-    fn merge_resets_misses_when_an_ap_returns() {
-        let current = vec![ap("Home", 60), ap("Cafe", 40)];
-        let (mut misses, known) = merge_ctx();
-        let partial = vec![ap("Home", 60)];
-        let _ = merge_ap_sets(&current, &partial, None, &mut misses, &known);
-        assert!(misses.contains_key("Cafe"));
+    fn merge_readmits_a_returning_ap() {
+        let current = vec![ap("Home", 60)];
         let full = vec![ap("Home", 60), ap("Cafe", 40)];
-        let out = merge_ap_sets(&current, &full, None, &mut misses, &known);
-        assert!(!misses.contains_key("Cafe"));
+        let out = merge_ap_sets(&current, &full, None, &known());
         assert_eq!(ssids(&out), vec!["Home", "Cafe"]);
     }
 
@@ -722,7 +709,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>(),
             ),
-            active_ssid: active.map(String::from),
+            active_ssid: active.map(Ssid::from),
             ..Model::empty()
         }
     }

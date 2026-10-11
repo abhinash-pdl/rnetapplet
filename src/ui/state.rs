@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::theme::StrengthSetter;
-use crate::state::{BackendCmd, Model};
+use crate::nm_client::aps::Security;
+use crate::state::{BackendCmd, Model, Ssid};
 use crate::ui::list::refresh_list;
 
 pub type ActionBtn = (gtk4::Button, gtk4::Box, gtk4::Box);
@@ -22,20 +23,20 @@ pub(crate) struct UiHandles {
 
     pub anim_until: Rc<Cell<i64>>,
 
-    pub extra_heights: Rc<RefCell<HashMap<String, i32>>>,
+    pub extra_heights: Rc<RefCell<HashMap<Ssid, i32>>>,
     pub scroll: gtk4::ScrolledWindow,
     pub list: gtk4::ListBox,
     pub root: gtk4::Window,
     pub model: Rc<RefCell<Arc<Model>>>,
     pub query: Rc<RefCell<String>>,
-    pub expanded: Rc<RefCell<Option<String>>>,
-    pub errors: Rc<RefCell<HashMap<String, String>>>,
-    pub focus_ssid: Rc<RefCell<Option<String>>>,
-    pub pw_drafts: Rc<RefCell<HashMap<String, String>>>,
-    pub connecting: Rc<RefCell<HashMap<String, Instant>>>,
-    pub pw_attempt: Rc<RefCell<HashSet<String>>>,
-    pub unsaved_attempt: Rc<RefCell<HashSet<String>>>,
-    pub pending_secret_paths: Rc<RefCell<HashMap<String, String>>>,
+    pub expanded: Rc<RefCell<Option<Ssid>>>,
+    pub errors: Rc<RefCell<HashMap<Ssid, String>>>,
+    pub focus_ssid: Rc<RefCell<Option<Ssid>>>,
+    pub pw_drafts: Rc<RefCell<HashMap<Ssid, String>>>,
+    pub connecting: Rc<RefCell<HashMap<Ssid, Instant>>>,
+    pub pw_attempt: Rc<RefCell<HashSet<Ssid>>>,
+    pub unsaved_attempt: Rc<RefCell<HashSet<Ssid>>>,
+    pub pending_secret_paths: Rc<RefCell<HashMap<Ssid, String>>>,
     pub hidden_expanded: Rc<Cell<bool>>,
     pub hidden_closing: Rc<Cell<bool>>,
     pub hidden_card: Rc<RefCell<Option<(gtk4::Revealer, gtk4::ListBoxRow)>>>,
@@ -48,22 +49,23 @@ pub(crate) struct UiHandles {
     pub hotspot_psk: Rc<RefCell<String>>,
     pub speeds: Rc<RefCell<(Option<u64>, Option<u64>)>>,
     pub speed_labels: Rc<RefCell<Option<(gtk4::Label, gtk4::Label)>>>,
-    pub revealers: Rc<RefCell<HashMap<String, gtk4::Revealer>>>,
-    pub chevrons: Rc<RefCell<HashMap<String, gtk4::Image>>>,
+    pub revealers: Rc<RefCell<HashMap<Ssid, gtk4::Revealer>>>,
+    pub chevrons: Rc<RefCell<HashMap<Ssid, gtk4::Image>>>,
 
-    pub rows: Rc<RefCell<HashMap<String, gtk4::ListBoxRow>>>,
-    pub action_btns: Rc<RefCell<HashMap<String, ActionBtn>>>,
-    pub card_actions: Rc<RefCell<HashMap<String, gtk4::Box>>>,
-    pub status: Rc<RefCell<HashMap<String, gtk4::Box>>>,
-    pub error_labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
-    pub ssid_labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
-    pub pw_entries: Rc<RefCell<HashMap<String, gtk4::PasswordEntry>>>,
-    pub strength_setters: Rc<RefCell<HashMap<String, StrengthSetter>>>,
+    pub rows: Rc<RefCell<HashMap<Ssid, gtk4::ListBoxRow>>>,
+    pub action_btns: Rc<RefCell<HashMap<Ssid, ActionBtn>>>,
+    pub card_actions: Rc<RefCell<HashMap<Ssid, gtk4::Box>>>,
+    pub status: Rc<RefCell<HashMap<Ssid, gtk4::Box>>>,
+    pub error_labels: Rc<RefCell<HashMap<Ssid, gtk4::Label>>>,
+    pub ssid_labels: Rc<RefCell<HashMap<Ssid, gtk4::Label>>>,
+    pub pw_entries: Rc<RefCell<HashMap<Ssid, gtk4::PasswordEntry>>>,
+    pub strength_setters: Rc<RefCell<HashMap<Ssid, StrengthSetter>>>,
     pub visible: Rc<Cell<bool>>,
     pub search_entry: Rc<RefCell<Option<gtk4::Widget>>>,
     pub hidden_entries: Rc<RefCell<Vec<gtk4::Widget>>>,
     pub hotspot_entries: Rc<RefCell<Vec<gtk4::Widget>>>,
     pub was_editing: Rc<Cell<bool>>,
+    pub notify_gen: Rc<Cell<u64>>,
     pub in_refresh: Rc<Cell<bool>>,
     pub pw_hovered: Rc<Cell<bool>>,
     pub scan_frozen: Arc<AtomicBool>,
@@ -71,8 +73,7 @@ pub(crate) struct UiHandles {
     pub pending_rebuild: Rc<Cell<bool>>,
 
     pub rebuild_queued: Rc<Cell<bool>>,
-    pub last_strengths: Rc<RefCell<HashMap<String, u8>>>,
-    pub ap_misses: Rc<RefCell<HashMap<String, u8>>>,
+    pub last_strengths: Rc<RefCell<HashMap<Ssid, u8>>>,
     pub cmd_tx: async_channel::Sender<BackendCmd>,
 }
 
@@ -143,7 +144,7 @@ impl UiHandles {
 
     pub fn typing_in_password(&self) -> bool {
         let expanded = self.expanded.borrow();
-        let Some(target) = expanded.as_deref() else {
+        let Some(target) = expanded.as_ref() else {
             return false;
         };
         let Some(entry) = self.pw_entries.borrow().get(target).cloned() else {
@@ -151,6 +152,13 @@ impl UiHandles {
         };
         let entry: gtk4::Widget = entry.upcast();
         self.focused_within(std::slice::from_ref(&entry))
+    }
+
+    pub fn should_grab_password_focus(&self, ssid: &Ssid) -> bool {
+        if self.connecting.borrow().contains_key(ssid) {
+            return true;
+        }
+        !self.errors.borrow().contains_key(ssid)
     }
 
     pub fn editing_protected(&self) -> bool {
@@ -165,9 +173,17 @@ impl UiHandles {
     }
 
     pub fn sync_scan_lock(&self) {
-        let frozen = self.any_entry_focused() || self.pw_hovered.get();
+        let frozen = !self.connecting.borrow().is_empty()
+            || !self.pw_attempt.borrow().is_empty()
+            || !self.unsaved_attempt.borrow().is_empty()
+            || self.hidden_is_focused()
+            || self.hotspot_is_focused()
+            || self.pw_hovered.get();
+        let was = self.scan_frozen.swap(frozen, Ordering::Relaxed);
         tracing::debug!(frozen, expanded = ?self.expanded.borrow(), "scan lock sync");
-        self.scan_frozen.store(frozen, Ordering::Relaxed);
+        if was && !frozen {
+            let _ = self.cmd_tx.try_send(crate::state::BackendCmd::Rescan);
+        }
     }
 
     pub fn sync_focus(&self) {
@@ -187,7 +203,10 @@ impl UiHandles {
         let Some(ssid) = self.focus_ssid.borrow().clone() else {
             return;
         };
-        if self.expanded.borrow().as_deref() != Some(ssid.as_str()) {
+        if !self.should_grab_password_focus(&ssid) {
+            return;
+        }
+        if self.expanded.borrow().as_ref() != Some(&ssid) {
             return;
         }
         if self.any_entry_focused() {
@@ -238,14 +257,23 @@ impl UiHandles {
     }
 
     pub fn prune_drafts(&self) {
-        let live: HashSet<String> = self
+        let mut live: HashSet<Ssid> = self
             .model
             .borrow()
             .aps
             .iter()
             .map(|a| a.ssid.clone())
-            .chain(self.model.borrow().active_ssid.clone())
             .collect();
+        if let Some(ssid) = &self.model.borrow().active_ssid {
+            live.insert(ssid.clone());
+        }
+        if let Some(ssid) = &self.model.borrow().activating_ssid {
+            live.insert(ssid.clone());
+        }
+        live.extend(self.connecting.borrow().keys().cloned());
+        live.extend(self.pw_attempt.borrow().iter().cloned());
+        live.extend(self.unsaved_attempt.borrow().iter().cloned());
+        live.extend(self.pending_secret_paths.borrow().keys().cloned());
         self.pw_drafts.borrow_mut().retain(|k, _| live.contains(k));
         self.connecting.borrow_mut().retain(|k, _| live.contains(k));
         self.pending_secret_paths
@@ -267,21 +295,13 @@ pub(crate) fn shell_equivalent(a: &Model, b: &Model) -> bool {
         && a.wifi_enabled == b.wifi_enabled
         && a.networking_enabled == b.networking_enabled
         && a.wired == b.wired
-        && a.saved_ssids == b.saved_ssids
         && UiHandles::hotspot_active(a) == UiHandles::hotspot_active(b)
         && a.hotspot.as_ref().map(|h| (&h.ssid, &h.psk))
             == b.hotspot.as_ref().map(|h| (&h.ssid, &h.psk))
 }
 
-pub(crate) fn ap_layout_key(ap: &crate::state::Ap) -> (&str, bool, bool, bool, bool, i32) {
-    (
-        ap.ssid.as_str(),
-        ap.secured,
-        ap.enterprise,
-        ap.wep,
-        ap.saved,
-        ap.priority,
-    )
+pub(crate) fn ap_layout_key(ap: &crate::state::Ap) -> (Security, bool, i32) {
+    (ap.security, ap.saved, ap.priority)
 }
 
 pub(crate) fn list_equivalent(a: &Model, b: &Model) -> bool {
@@ -292,7 +312,7 @@ pub(crate) fn list_equivalent(a: &Model, b: &Model) -> bool {
         return false;
     }
 
-    fn key_of(m: &Model) -> HashMap<&str, (&str, bool, bool, bool, bool, i32)> {
+    fn key_of(m: &Model) -> HashMap<&str, (Security, bool, i32)> {
         m.aps
             .iter()
             .map(|ap| (ap.ssid.as_str(), ap_layout_key(ap)))
@@ -312,17 +332,16 @@ pub(crate) fn structural_change(old: &Model, new: &Model) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nm_client::aps::{Bands, Security};
     use crate::state::Ap;
 
     fn ap(ssid: &str, strength: u8) -> Ap {
         Ap {
             ssid: ssid.into(),
             strength,
-            secured: true,
-            enterprise: false,
-            wep: false,
+            security: Security::Wpa,
             freq_mhz: None,
-            bands: 0,
+            bands: Bands::NONE,
             saved: false,
             known: false,
             priority: 0,
@@ -367,16 +386,12 @@ mod tests {
     #[test]
     fn becoming_secured_is_structural() {
         let a = model(vec![Ap {
-            secured: false,
-            enterprise: false,
-            wep: false,
+            security: Security::Open,
             freq_mhz: None,
             ..ap("A", 30)
         }]);
         let b = model(vec![Ap {
-            secured: true,
-            enterprise: false,
-            wep: false,
+            security: Security::Wpa,
             freq_mhz: None,
             ..ap("A", 30)
         }]);

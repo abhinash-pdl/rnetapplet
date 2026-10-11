@@ -155,7 +155,10 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                 *h.hotspot_psk.borrow_mut() = psk.clone();
                 btn.grab_focus();
                 collapse_hotspot(&h);
-                let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot { ssid, psk });
+                let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot {
+                    ssid: ssid.into(),
+                    psk: psk.into(),
+                });
             });
         }
     }

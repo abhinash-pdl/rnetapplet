@@ -3,22 +3,24 @@
 A NetworkManager tray applet for wlroots-based Wayland compositors
 (niri, Hyprland, Sway, river, …) that have no built-in network UI.
 
-It runs as a single binary, sits in the tray as a StatusNotifierItem, and
-opens a small popup for managing Wi-Fi — connect to networks, enter
-passwords, turn Wi-Fi, airplane mode and the hotspot on or off, and even
-Connect via a QR code. There is no separate settings window for network
+It runs as a small resident tray process plus short-lived popup and
+scanner windows: the tray owns the NetworkManager connection and state,
+while each popup is a separate process that exits when closed, so UI
+memory is fully reclaimed. The popup manages Wi-Fi (connect to networks,
+enter passwords, turn Wi-Fi, airplane mode and the hotspot on or off, and
+even connect via a QR code). There is no separate settings window for network
 connections; everything happens inside the popup.
 
 ## Features
 
 - Nearby networks listed live with signal bands (2.4G/5G/6G), sorted by signal strength
-- Every network row expands to a details card — connect/forget, band,
-  saved state — so open and secured networks behave the same
+- Every network row expands to a details card (connect/forget, band,
+  saved state), so open and secured networks behave the same
 - One-click connect to saved or open networks; saved networks stay
   listed with connect/forget even out of range
 - Warns inside the popup and on the tray icon when a connection has no
   internet access, and when NetworkManager is unavailable
-- Inline password entry — the applet acts as its own NetworkManager
+- Inline password entry: the applet acts as its own NetworkManager
   SecretAgent, so a wrong password can be retried without a dialog
 - Malformed passwords are rejected before they reach NetworkManager, and
   if a connect attempt fails, the previous network is re-activated
@@ -49,7 +51,9 @@ connections; everything happens inside the popup.
 ## Requirements
 
 - A Wayland compositor that supports `wlr-layer-shell`
-- NetworkManager running as the system network service
+- NetworkManager running as the system network service (works with
+  either the `wpa_supplicant` or `iwd` Wi-Fi backend, since the applet only
+  uses NetworkManager's own D-Bus API, which is identical for both)
 - A tray host with StatusNotifierItem support (e.g. the waybar `tray`
   module, swaync)
 - Optional: a webcam for QR-code camera scanning
@@ -98,14 +102,18 @@ install it:
 
 ```sh
 curl -L -o rnetapplet.tar.gz \
-  https://github.com/abhinash-pdl/rnetapplet/releases/download/v0.1.4/rnetapplet-0.1.4-x86_64-linux.tar.gz
-echo "c580306f5ca23ebf284e53280fe6ae2d4eca2b7c92ac2f9fe51678a2a5c34296  rnetapplet.tar.gz" | sha256sum -c -
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v1.0.0/rnetapplet-1.0.0-x86_64-linux.tar.gz
+echo "5fa9ac03cbf28dd41a63c4321b0c904b3c643176f63f90a84264f59b3fef66e7  rnetapplet.tar.gz" | sha256sum -c -
 tar xzf rnetapplet.tar.gz
-cd rnetapplet-0.1.4-x86_64-linux
+cd rnetapplet-1.0.0-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
 ```
+
+On 64-bit ARM machines, use the `rnetapplet-1.0.0-aarch64-linux.tar.gz`
+asset from the same release instead (same steps, same checksum flow with
+its own `.sha256` file).
 
 ### cargo
 
@@ -181,7 +189,7 @@ journalctl --user -u rnetapplet -f          # follow its logs
 ```
 
 The user manager starts with a minimal environment: variables your desktop
-session exports — `GTK_THEME`, `GDK_BACKEND`, GPU/Mesa overrides, and so on —
+session exports (`GTK_THEME`, `GDK_BACKEND`, GPU/Mesa overrides, and so on)
 are not carried over, which can make the popup render in a default theme, at
 a different scale, or through a software-GL path. Give the service the same
 environment as your session, per-service, with a drop-in:
@@ -246,6 +254,10 @@ RUST_LOG=rnetapplet=debug cargo run
 The code is split into `nm_client` (NetworkManager over D-Bus),
 `secret_agent` (the NetworkManager SecretAgent implementation), `tray`
 (the StatusNotifierItem), `ui` (the GTK4 + wlr-layer-shell popup), and
-`qr` / `qr_scan` (QR decode and camera scanning). GTK runs on the main
-thread and the NetworkManager/tray work runs on a background tokio runtime;
-the two are connected with channels.
+`qr` / `qr_scan` (QR decode and camera scanning). The resident process owns
+the NetworkManager connection, the tray icon and the background tokio
+runtime and never initializes GTK, so idle memory stays small. The popup
+and the QR scanner each run as a short-lived child process
+(`rnetapplet --popup-child`, `rnetapplet --scan-qr`) that renders models
+streamed over a pipe and sends commands back the same way; when the window
+closes, the process exits and the OS reclaims all of its memory.

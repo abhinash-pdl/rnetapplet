@@ -6,7 +6,8 @@ UNITDIR = $(DESTDIR)$(PREFIX)/lib/systemd/user
 
 BIN = rnetapplet
 VER = $(shell grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-DISTDIR = $(BIN)-$(VER)-x86_64-linux
+ARCH ?= x86_64
+DISTDIR = $(BIN)-$(VER)-$(ARCH)-linux
 DISTBALL = $(DISTDIR).tar.gz
 
 .PHONY: all build build-release install uninstall check test clean dist

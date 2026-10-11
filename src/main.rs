@@ -1,4 +1,4 @@
-mod failover;
+mod auto;
 mod nm_client;
 mod qr;
 mod qr_scan;
@@ -8,28 +8,70 @@ mod tray;
 mod ui;
 use anyhow::Result;
 use gtk4::gio::prelude::FileExt as _;
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HELP: &str = "rnetapplet — NetworkManager tray applet for wlroots compositors
 USAGE:
     rnetapplet [FLAGS] [OPTIONS]
 FLAGS:
     --dump-aps            Print visible access points and exit
     --camera-test         Probe the camera + QR decode path and exit
+    --scan-qr             Run the QR scanner window and print the result as JSON
+    --popup-child         Run the network popup window (spawned by the tray process)
     --hotspot-test        Create a hotspot, observe, stop it, restore Wi-Fi, exit
-    --no-auto-failover    Disable automatic switch to a working saved network
-                        and automatic connect while disconnected
+    --no-auto-failover    Do not nudge a saved network when connected but offline
     -h, --help            Print this help
     -V, --version         Print version
 OPTIONS:
     --connect-saved <SSID>  Activate a saved profile and exit
-    --psk <SECRET>          With --connect-saved: replace the saved password first (retry path)
+    --psk <SECRET>          With --connect-saved: stage the password for the attempt; stored only after the handshake succeeds
     --wifi <on|off>         Set the Wi-Fi radio and exit
 ENV:
     RUST_LOG                Tracing filter (default: info), e.g. RUST_LOG=rnetapplet=debug
     RNETAPPLET_NO_AUTO_FAILOVER=1  Same as --no-auto-failover
 ";
+fn process_is_rnetapplet(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "rnetapplet")
+        .unwrap_or(false)
+}
+
+fn claim_instance_lock() -> Result<()> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let lock = dir.join("rnetapplet.lock");
+    for _ in 0..2 {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .is_ok()
+        {
+            std::fs::write(&lock, std::process::id().to_string())?;
+            return Ok(());
+        }
+        let live = std::fs::read_to_string(&lock)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != std::process::id())
+            .is_some_and(process_is_rnetapplet);
+        if live {
+            let pid = std::fs::read_to_string(&lock)
+                .map(|text| text.trim().to_string())
+                .unwrap_or_else(|_| "?".into());
+            anyhow::bail!(
+                "another rnetapplet instance is already running (pid {pid}); refusing a second copy"
+            );
+        }
+        let _ = std::fs::remove_file(&lock);
+    }
+    anyhow::bail!("could not claim the rnetapplet instance lock")
+}
 async fn shutdown_signal() {
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(s) => s,
@@ -56,6 +98,38 @@ fn main() -> Result<()> {
         )
         .with_ansi(false)
         .init();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let msg = format!(
+            "panic at {}\npayload: {}\nthread: {}\nbacktrace:\n{backtrace}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            info,
+            std::thread::current().name().unwrap_or("<unnamed>"),
+        );
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            });
+        if let Some(base) = base {
+            let dir = base.join("rnetapplet");
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+            {
+                use std::io::Write as _;
+                let _ = f.write_all(msg.as_bytes());
+            }
+        }
+        eprintln!("{msg}");
+    }));
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
@@ -71,6 +145,7 @@ fn main() -> Result<()> {
     let psk = take_value(&args, "--psk");
     let set_wifi = take_value(&args, "--wifi");
     let camera_test = args.iter().any(|a| a == "--camera-test");
+    let scan_qr = args.iter().any(|a| a == "--scan-qr");
     let hotspot_test = args.iter().any(|a| a == "--hotspot-test");
     if let Some(v) = &set_wifi
         && v != "on"
@@ -78,9 +153,26 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--wifi expects on|off, got {v:?}");
     }
-    if dump || connect_saved.is_some() || set_wifi.is_some() || camera_test || hotspot_test {
+    if dump
+        || connect_saved.is_some()
+        || set_wifi.is_some()
+        || camera_test
+        || hotspot_test
+        || scan_qr
+        || args.iter().any(|a| a == "--popup-child")
+    {
         if camera_test {
             return qr_scan::camera_self_test();
+        }
+        if scan_qr {
+            let parent = take_value(&args, "--parent-pid").and_then(|s| s.parse::<u32>().ok());
+            return qr_scan::scanner_child(parent);
+        }
+        if args.iter().any(|a| a == "--popup-child") {
+            let x = take_value(&args, "--popup-x").and_then(|s| s.parse::<i32>().ok());
+            let y = take_value(&args, "--popup-y").and_then(|s| s.parse::<i32>().ok());
+            let pos = x.zip(y);
+            return ui::child::run_popup_child(pos);
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -96,13 +188,13 @@ fn main() -> Result<()> {
         }
         return rt.block_on(dump_aps());
     }
+    claim_instance_lock()?;
     if std::env::var_os("GDK_BACKEND").is_none() {
         unsafe { std::env::set_var("GDK_BACKEND", "wayland,x11") };
     }
-    warm_up_graphics(std::time::Duration::from_secs(20));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(2)
+        .worker_threads(4)
         .max_blocking_threads(4)
         .build()?;
     let (client, initial) = rt.block_on(async {
@@ -116,16 +208,16 @@ fn main() -> Result<()> {
     })?;
     let (model_feed_tx, model_feed_rx) = async_channel::bounded::<state::UiEvent>(64);
     let (toggle_tx, toggle_rx) = async_channel::bounded::<Option<(i32, i32)>>(4);
-    let (quit_tx, quit_rx) = async_channel::bounded::<()>(2);
     let popup_visible = client.popup_visible();
     let scan_frozen = Arc::new(AtomicBool::new(false));
-    let (tray_ev_tx, tray_ev_rx) = async_channel::bounded::<tray::TrayEvent>(16);
-    rt.spawn(backend_main(
+    let (tray_ev_tx, tray_ev_rx) = async_channel::bounded::<tray::TrayEvent>(64);
+    rt.block_on(backend_main(
         client,
         initial.clone(),
         model_feed_tx,
+        model_feed_rx,
         toggle_tx,
-        quit_tx.clone(),
+        toggle_rx,
         tray_ev_tx.clone(),
         tray_ev_rx,
         popup_visible.clone(),
@@ -133,30 +225,32 @@ fn main() -> Result<()> {
         !args.iter().any(|a| a == "--no-auto-failover")
             && std::env::var_os("RNETAPPLET_NO_AUTO_FAILOVER") != Some("1".into()),
     ));
-    info!("starting layer-shell popup (main thread)");
-    ui::run(
-        initial,
-        model_feed_rx,
-        toggle_rx,
-        quit_rx,
-        tray_ev_tx,
-        popup_visible,
-        scan_frozen,
-    );
-    rt.shutdown_background();
     Ok(())
 }
 fn validate_args(args: &[String]) -> Result<()> {
-    const FLAGS: [&str; 7] = [
+    const FLAGS: [&str; 13] = [
         "--dump-aps",
         "--connect-saved",
         "--wifi",
         "--psk",
         "--camera-test",
+        "--scan-qr",
+        "--parent-pid",
+        "--popup-child",
+        "--popup-x",
+        "--popup-y",
         "--hotspot-test",
+        "--no-auto-failover",
         "--version",
     ];
-    const VALUED: [&str; 3] = ["--connect-saved", "--wifi", "--psk"];
+    const VALUED: [&str; 6] = [
+        "--connect-saved",
+        "--wifi",
+        "--psk",
+        "--parent-pid",
+        "--popup-x",
+        "--popup-y",
+    ];
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -178,16 +272,19 @@ fn validate_args(args: &[String]) -> Result<()> {
 async fn connect_saved_test(ssid: &str, psk: Option<&str>) -> Result<()> {
     let client = nm_client::NmClient::connect().await?;
     info!(version = %client.version().await?, "connected to NetworkManager");
+    let secrets = secret_agent::SecretStore::new();
     let prev = client
         .active_wifi_snapshot()
         .await
         .map(|(profile, ssid)| nm_client::connect::PrevWifi { profile, ssid });
-    let mut rollback = None;
+    let mut commit = None;
     match psk {
         Some(secret) => {
-            let retry = client.retry_saved_with_psk(ssid, secret).await?;
-            rollback = retry.rollback;
-            println!("supplied password written; waiting for the handshake…");
+            let retry = client
+                .retry_saved_with_psk(ssid, state::Secret::from(secret), &secrets)
+                .await?;
+            commit = retry.commit;
+            println!("supplied password staged, not written; waiting for the handshake…");
         }
         None => {
             client.connect_saved(ssid).await?;
@@ -203,15 +300,23 @@ async fn connect_saved_test(ssid: &str, psk: Option<&str>) -> Result<()> {
             active.as_deref().unwrap_or("(none)")
         );
         if active.as_deref() == Some(ssid) {
-            println!("RESULT: connected to {ssid}");
+            if let Some(path) = &commit {
+                if let Some(proof) = secrets.take_served_psk(&path.to_string()).await {
+                    client.update_psk(path, proof.as_str()).await?;
+                    println!("RESULT: connected; the verified password was saved");
+                } else {
+                    println!(
+                        "RESULT: connected with the stored password; the supplied password was not needed and was not saved"
+                    );
+                }
+            } else {
+                println!("RESULT: connected to {ssid}");
+            }
             return Ok(());
         }
         last = active;
     }
-    if let Some((profile, old)) = &rollback {
-        client.update_psk(profile, old).await?;
-        println!("RESULT: failed; the previous saved password was put back");
-    }
+    println!("RESULT: failed; the stored password was never touched");
     if let Some(prev) = prev {
         let _ = client.reactivate_previous(&prev.ssid, &prev.profile).await;
         println!("RESULT: restored {}", prev.ssid);
@@ -331,7 +436,11 @@ async fn dump_aps() -> Result<()> {
             "{:>3}%  {:<32} {} {}",
             ap.strength,
             ap.ssid,
-            if ap.secured { "🔒" } else { "  " },
+            if ap.security.is_secured() {
+                "🔒"
+            } else {
+                "  "
+            },
             if ap.saved { "[saved]" } else { "" },
         );
     }
@@ -418,37 +527,14 @@ fn audit_icons() {
 fn take_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
-fn warm_up_graphics(timeout: std::time::Duration) -> bool {
-    let have_display =
-        std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-    if !have_display {
-        tracing::warn!(
-            "no WAYLAND_DISPLAY/DISPLAY yet; the tray will start and the popup will attach later"
-        );
-        return false;
-    }
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if gtk4::init().is_ok() && gtk4::gdk::Display::default().is_some() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                "still no usable display after {}s; continuing tray-only",
-                timeout.as_secs()
-            );
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-}
 #[allow(clippy::too_many_arguments)]
 async fn backend_main(
     client: Arc<nm_client::NmClient>,
     initial: state::Model,
     model_feed: async_channel::Sender<state::UiEvent>,
+    model_feed_rx: async_channel::Receiver<state::UiEvent>,
     toggle_tx: async_channel::Sender<Option<(i32, i32)>>,
-    quit_tx: async_channel::Sender<()>,
+    toggle_rx: async_channel::Receiver<Option<(i32, i32)>>,
     tray_ev_tx: async_channel::Sender<tray::TrayEvent>,
     tray_ev_rx: async_channel::Receiver<tray::TrayEvent>,
     popup_visible: Arc<AtomicBool>,
@@ -463,27 +549,30 @@ async fn backend_main(
         client.clone(),
         watch_tx.clone(),
         popup_visible.clone(),
-        scan_frozen,
+        scan_frozen.clone(),
     ));
-    let _signal_watch = nm_client::signals::spawn_signal_watcher(client.clone(), refresher.clone());
+    let signal_watch =
+        nm_client::signals::spawn_signal_watcher(client.clone(), Arc::downgrade(&refresher));
     let secrets = secret_agent::SecretStore::new();
     let hotspot_expected = Arc::new(AtomicBool::new(false));
     if let Err(e) = secret_agent::register(&client, secrets.clone(), model_feed.clone()).await {
         tracing::warn!("SecretAgent registration failed (inline passwords unavailable): {e:#}");
-        let client = client.clone();
-        let secrets = secrets.clone();
-        let model_feed = model_feed.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            if let Err(e) = secret_agent::register(&client, secrets, model_feed).await {
-                tracing::warn!("SecretAgent registration retry failed: {e:#}");
+        for attempt in 1..=2 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match secret_agent::register(&client, secrets.clone(), model_feed.clone()).await {
+                Ok(()) => {
+                    tracing::info!("SecretAgent registered on retry");
+                    break;
+                }
+                Err(e) if attempt == 2 => {
+                    tracing::warn!("SecretAgent registration retry failed: {e:#}");
+                }
+                Err(_) => {}
             }
-        });
+        }
     }
     let _heartbeat = tokio::spawn({
         let client = client.clone();
-        let watch_tx = watch_tx.clone();
-        let watch_rx = watch_rx.clone();
         let model_feed = model_feed.clone();
         let secrets = secrets.clone();
         let refresher = refresher.clone();
@@ -491,8 +580,19 @@ async fn backend_main(
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut offline = false;
+            let mut ticks = 0u64;
             loop {
                 tick.tick().await;
+                ticks += 1;
+                if ticks.is_multiple_of(4) {
+                    let tasks = tokio::runtime::Handle::current()
+                        .metrics()
+                        .num_alive_tasks() as u64;
+                    info!(tasks, "backend heartbeat");
+                }
+                if ticks.is_multiple_of(20) {
+                    crate::ui::placement::trim_memory();
+                }
                 if client.nm.version().await.is_ok() {
                     if offline {
                         offline = false;
@@ -505,14 +605,13 @@ async fn backend_main(
                         }
                         refresher.request(nm_client::signals::Cmd::Scan);
                     }
+                    refresher.request(nm_client::signals::Cmd::Refresh);
                     continue;
                 }
                 if !offline {
                     offline = true;
                     tracing::warn!("NetworkManager unreachable, showing last-known state");
-                    let mut m = watch_rx.borrow().as_ref().clone();
-                    m.nm_online = false;
-                    let _ = watch_tx.send(Arc::new(m));
+                    refresher.publish_with(|m| m.nm_online = false);
                 }
             }
         }
@@ -529,7 +628,7 @@ async fn backend_main(
             Some((rx.trim().parse().ok()?, tx.trim().parse().ok()?))
         }
         async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last: Option<(String, u64, u64, std::time::Instant)> = None;
             let mut sent_none = false;
@@ -573,39 +672,34 @@ async fn backend_main(
             }
         }
     });
-    let tray_handle: Arc<tokio::sync::OnceCell<ksni::Handle<tray::RnetTray>>> =
-        Arc::new(tokio::sync::OnceCell::new());
-    let last_connect: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let tray_service = tray::TrayService::start(
+        watch_rx.borrow().clone(),
+        tray_ev_tx.clone(),
+        toggle_tx.clone(),
+    );
     let last_manual_disconnect: Arc<tokio::sync::Mutex<Option<std::time::Instant>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     if auto_failover {
-        failover::spawn(
+        auto::spawn(
             watch_rx.clone(),
             tray_ev_tx.clone(),
-            last_connect.clone(),
             last_manual_disconnect.clone(),
         );
     }
-    let _tray_task = {
-        let tray_handle = tray_handle.clone();
-        let tray_rx = watch_rx.clone();
+    let tray_sender = tray_service.clone_sender();
+    let tray_bridge = {
+        let watch_rx = watch_rx.clone();
         tokio::spawn(async move {
-            let mut wait = std::time::Duration::from_secs(3);
+            let mut rx = watch_rx;
             loop {
-                match tray::spawn(model.clone(), tray_ev_tx.clone()).await {
-                    Ok(h) => {
-                        info!("tray registered as org.kde.StatusNotifierItem (id=rnetapplet)");
-                        let updater = tray::spawn_updater(h.clone(), tray_rx.clone());
-                        let _ = tray_handle.set(h);
-                        let _ = updater.await;
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("SNI tray host not available ({e:#}); retrying in {wait:?}");
-                        tokio::time::sleep(wait).await;
-                        wait = (wait * 2).min(std::time::Duration::from_secs(30));
-                    }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let m = rx.borrow().clone();
+                match tray_sender.try_send(m) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
                 }
             }
         })
@@ -614,74 +708,290 @@ async fn backend_main(
         let mut rx = watch_rx.clone();
         let model_feed = model_feed.clone();
         async move {
+            let mut dropped = 0u64;
             loop {
                 if rx.changed().await.is_err() {
                     break;
                 }
                 let m = rx.borrow().clone();
                 let n = m.aps.len();
-                if model_feed.send(state::UiEvent::Model(m)).await.is_err() {
-                    break;
+                match model_feed.try_send(state::UiEvent::Model(m)) {
+                    Ok(()) => {
+                        if dropped > 0 {
+                            tracing::info!("ui caught up after {dropped} dropped models");
+                            dropped = 0;
+                        }
+                    }
+                    Err(async_channel::TrySendError::Full(_)) => {
+                        dropped += 1;
+                        if dropped == 1 || dropped.is_multiple_of(50) {
+                            tracing::warn!(
+                                "ui not consuming models ({dropped} dropped); latest state will follow"
+                            );
+                        }
+                    }
+                    Err(async_channel::TrySendError::Closed(_)) => break,
                 }
                 tracing::debug!(aps = n, "model handed to ui");
             }
         }
     });
-    let guards: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let manual_disconnect = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    macro_rules! settle {
-        () => {
-            refresher
-                .request_and_wait(
-                    nm_client::signals::Cmd::Refresh,
-                    std::time::Duration::from_secs(4),
-                )
-                .await
-        };
+    struct PopupProc {
+        child: tokio::process::Child,
+        stdin: tokio::process::ChildStdin,
     }
-    macro_rules! guarded_connect {
-        ($ssid:expr, $call:expr) => {{
-            let prev =
-                client
-                    .active_wifi_snapshot()
-                    .await
-                    .map(|(p, s)| nm_client::connect::PrevWifi {
-                        profile: p,
-                        ssid: s,
-                    });
-            manual_disconnect.store(false, Ordering::Relaxed);
-            let outcome: anyhow::Result<Option<zbus::zvariant::OwnedObjectPath>> = $call.await;
-            match outcome {
-                Ok(created) => {
-                    *last_connect.lock().await = Some(std::time::Instant::now());
-                    nm_client::connect::spawn_restore_guard(
-                        client.clone(),
-                        watch_rx.clone(),
-                        model_feed.clone(),
-                        nm_client::connect::GuardOpts {
-                            target_ssid: $ssid.clone(),
-                            prev,
-                            window: std::time::Duration::from_secs(30),
-                            registry: guards.clone(),
-                            created,
-                            manual: manual_disconnect.clone(),
-                            rollback_psk: None,
-                        },
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!("connect {} failed: {e:#}", $ssid);
-                    let _ = client.restore_previous(prev).await;
-                    let _ = model_feed.try_send(state::UiEvent::SsidError {
-                        ssid: $ssid.clone(),
-                        message: format!("Could not connect: {e:#}"),
-                    });
+    async fn write_event(
+        stdin: &mut tokio::process::ChildStdin,
+        ev: &state::UiEvent,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut line = serde_json::to_vec(ev)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        stdin.write_all(&line).await?;
+        stdin.flush().await
+    }
+    async fn spawn_popup(
+        watch_rx: &state::ModelRx,
+        tray_ev_tx: &async_channel::Sender<tray::TrayEvent>,
+        visible: &Arc<AtomicBool>,
+        pos: Option<(i32, i32)>,
+    ) -> Option<PopupProc> {
+        let exe = std::env::current_exe().ok()?;
+        let mut child = tokio::process::Command::new(exe);
+        child.arg("--popup-child");
+        if let Some((x, y)) = pos {
+            child
+                .arg("--popup-x")
+                .arg(x.to_string())
+                .arg("--popup-y")
+                .arg(y.to_string());
+        }
+        let mut child = child
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let tray_ev_tx = tray_ev_tx.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(cmd) = serde_json::from_str::<state::BackendCmd>(&line)
+                    && tray_ev_tx.send(cmd).await.is_err()
+                {
+                    break;
                 }
             }
-            settle!();
-        }};
+        });
+        let initial = state::UiEvent::Model(watch_rx.borrow().clone());
+        if write_event(&mut stdin, &initial).await.is_err() {
+            return None;
+        }
+        visible.store(true, Ordering::Relaxed);
+        Some(PopupProc { child, stdin })
     }
+    let popup_manager = {
+        let watch_rx = watch_rx.clone();
+        let tray_ev_tx = tray_ev_tx.clone();
+        let popup_visible = popup_visible.clone();
+        tokio::spawn(async move {
+            let mut proc: Option<PopupProc> = None;
+            loop {
+                if let Some(p) = proc.as_mut() {
+                    match p.child.try_wait() {
+                        Ok(Some(_)) | Err(_) => {
+                            proc = None;
+                            popup_visible.store(false, Ordering::Relaxed);
+                        }
+                        Ok(None) => {}
+                    }
+                }
+                tokio::select! {
+                    r = toggle_rx.recv() => {
+                        let Ok(pos) = r else { break };
+                        match proc.take() {
+                            Some(mut p) => {
+                                let _ = p.child.start_kill();
+                                let _ = p.child.wait().await;
+                                popup_visible.store(false, Ordering::Relaxed);
+                            }
+                            None => {
+                                proc = spawn_popup(&watch_rx, &tray_ev_tx, &popup_visible, pos).await;
+                            }
+                        }
+                    }
+                    r = model_feed_rx.recv() => {
+                        let Ok(ev) = r else { break };
+                        if let Some(p) = proc.as_mut()
+                            && write_event(&mut p.stdin, &ev).await.is_err()
+                        {
+                            proc = None;
+                            popup_visible.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        })
+    };
+    let ctx = ConnectCtx {
+        client: client.clone(),
+        watch_rx: watch_rx.clone(),
+        model_feed: model_feed.clone(),
+        refresher: refresher.clone(),
+        secrets: secrets.clone(),
+        scan_frozen: scan_frozen.clone(),
+    };
+    macro_rules! settle {
+        () => {
+            refresher.request(nm_client::signals::Cmd::Refresh)
+        };
+    }
+    async fn scan_once_now(client: &Arc<nm_client::NmClient>) -> bool {
+        let path = client.wifi_device_path().await.ok().flatten();
+        let Some(path) = path else {
+            return false;
+        };
+        client
+            .scan_and_wait(&path, nm_client::SCAN_WAIT)
+            .await
+            .unwrap_or(false)
+    }
+    async fn with_bus_timeout<T>(
+        secs: u64,
+        what: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!("{what} timed out after {secs}s; carrying on");
+                None
+            }
+        }
+    }
+    #[derive(Clone)]
+    struct ConnectCtx {
+        client: Arc<nm_client::NmClient>,
+        watch_rx: state::ModelRx,
+        model_feed: async_channel::Sender<state::UiEvent>,
+        refresher: Arc<nm_client::signals::Refresher>,
+        secrets: Arc<secret_agent::SecretStore>,
+        scan_frozen: Arc<AtomicBool>,
+    }
+    enum ConnectKind {
+        Open,
+        Saved,
+        Secure(state::Secret),
+        RetrySaved(state::Secret),
+        Hidden(state::Secret),
+    }
+    async fn guarded_connect(ctx: ConnectCtx, ssid: state::Ssid, kind: ConnectKind) {
+        tracing::info!(ssid = %ssid.as_str(), "connect started");
+        ctx.scan_frozen.store(true, Ordering::Relaxed);
+        let prev = with_bus_timeout(8, "previous-connection snapshot", async {
+            ctx.client
+                .active_wifi_snapshot()
+                .await
+                .map(|(p, s)| nm_client::connect::PrevWifi {
+                    profile: p,
+                    ssid: s,
+                })
+        })
+        .await
+        .flatten();
+        tracing::info!(ssid = %ssid.as_str(), "connect past snapshot");
+        let refresh: Arc<dyn Fn() + Send + Sync> = Arc::new({
+            let refresher = ctx.refresher.clone();
+            move || refresher.request(nm_client::signals::Cmd::Refresh)
+        });
+        let outcome = match kind {
+            ConnectKind::Open => {
+                tokio::time::timeout(CONNECT_TIMEOUT, ctx.client.connect_open(ssid.as_str())).await
+            }
+            ConnectKind::Saved => {
+                tokio::time::timeout(CONNECT_TIMEOUT, ctx.client.connect_saved(ssid.as_str())).await
+            }
+            ConnectKind::Secure(psk) => {
+                tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    ctx.client.connect_secure(ssid.as_str(), psk, &ctx.secrets),
+                )
+                .await
+            }
+            ConnectKind::RetrySaved(psk) => {
+                tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    ctx.client
+                        .retry_saved_with_psk(ssid.as_str(), psk, &ctx.secrets),
+                )
+                .await
+            }
+            ConnectKind::Hidden(psk) => {
+                tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    ctx.client.connect_hidden(ssid.as_str(), psk, &ctx.secrets),
+                )
+                .await
+            }
+        };
+        match outcome {
+            Ok(Ok(o)) => {
+                ctx.client
+                    .watch_attempt(
+                        &ssid,
+                        &o.active,
+                        prev,
+                        o.created,
+                        o.commit,
+                        o.persist_on_success,
+                        &ctx.secrets,
+                        &ctx.model_feed,
+                        &ctx.watch_rx,
+                        &refresh,
+                    )
+                    .await;
+            }
+            Ok(Err(e)) => {
+                ctx.scan_frozen.store(false, Ordering::Relaxed);
+                tracing::warn!("connect {} failed: {e:#}", ssid);
+                if let Some(p) = prev
+                    && p.ssid.as_str() != ssid.as_str()
+                {
+                    let _ = ctx.client.reactivate_previous(&p.ssid, &p.profile).await;
+                }
+                let _ = ctx.model_feed.try_send(state::UiEvent::SsidError {
+                    ssid: ssid.clone(),
+                    message: nm_client::connect::MSG_FAILED.into(),
+                });
+            }
+            Err(_) => {
+                ctx.scan_frozen.store(false, Ordering::Relaxed);
+                tracing::warn!("connect {} timed out", ssid);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    ctx.client.dispose_stuck_activation(ssid.as_str()),
+                )
+                .await;
+                if let Some(p) = prev
+                    && p.ssid.as_str() != ssid.as_str()
+                {
+                    let _ = ctx.client.reactivate_previous(&p.ssid, &p.profile).await;
+                }
+                let _ = ctx.model_feed.try_send(state::UiEvent::SsidError {
+                    ssid: ssid.clone(),
+                    message: nm_client::connect::MSG_FAILED.into(),
+                });
+            }
+        }
+        ctx.scan_frozen.store(false, Ordering::Relaxed);
+        ctx.refresher.request(nm_client::signals::Cmd::Refresh);
+    }
+    let mut last_scan_done: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = shutdown_signal() => {
@@ -695,47 +1005,80 @@ async fn backend_main(
                 };
                 match cmd {
                     state::BackendCmd::Rescan => {
-                        refresher.request(nm_client::signals::Cmd::Scan);
+                        let frozen = scan_frozen.load(Ordering::Relaxed);
+                        let fresh = last_scan_done.is_some_and(|t| {
+                            t.elapsed() < std::time::Duration::from_secs(30)
+                        });
+                        if !frozen && !fresh {
+                            let mut scanned =
+                                with_bus_timeout(20, "manual scan", scan_once_now(&client))
+                                    .await
+                                    .is_some_and(|ok| ok);
+                            if !scanned {
+                                tracing::info!(
+                                    "scan not accepted; retrying after the NM scan window"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+                                scanned =
+                                    with_bus_timeout(20, "manual scan retry", scan_once_now(&client))
+                                        .await
+                                        .is_some_and(|ok| ok);
+                            }
+                            if scanned {
+                                last_scan_done = Some(std::time::Instant::now());
+                            } else {
+                                tracing::info!("manual scan did not run");
+                            }
+                        } else {
+                            refresher.request(nm_client::signals::Cmd::Scan);
+                        }
+                        settle!();
                     }
                     state::BackendCmd::Refresh => {
                         refresher.request(nm_client::signals::Cmd::Refresh);
                     }
-                    state::BackendCmd::TogglePopup(pos) => {
-                        tracing::debug!("backend got TogglePopup");
-                        let _ = toggle_tx.try_send(pos);
-                    }
                     state::BackendCmd::SetWifi(on) => {
                         info!(on, "Wi-Fi toggle requested");
-                        if let Err(e) = client.set_wireless_enabled(on).await {
+                        if let Some(Err(e)) = with_bus_timeout(10, "Wi-Fi toggle", async {
+                            client.set_wireless_enabled(on).await
+                        })
+                        .await
+                        {
                             tracing::warn!("set_wireless_enabled failed: {e:#}");
                         }
                         settle!();
                     }
                     state::BackendCmd::SetAirplane(on) => {
                         info!(on, "airplane mode requested");
-                        if let Err(e) = client.set_airplane_mode(on).await {
+                        if let Some(Err(e)) = with_bus_timeout(10, "airplane toggle", async {
+                            client.set_airplane_mode(on).await
+                        })
+                        .await
+                        {
                             tracing::warn!("set_airplane_mode failed: {e:#}");
                         }
                         settle!();
                     }
                     state::BackendCmd::ConnectOpen(ssid) => {
-                        info!(ssid, "connect requested (open)");
-                        guarded_connect!(ssid, client.connect_open(&ssid));
+                        info!(ssid = %ssid.as_str(), "connect requested (open)");
+                        guarded_connect(ctx.clone(), ssid, ConnectKind::Open).await;
                     }
                     state::BackendCmd::ConnectSaved(ssid) => {
-                        info!(ssid, "connect requested (saved profile)");
-                        guarded_connect!(ssid, client.connect_saved(&ssid));
+                        info!(ssid = %ssid.as_str(), "connect requested (saved profile)");
+                        guarded_connect(ctx.clone(), ssid, ConnectKind::Saved).await;
                     }
                     state::BackendCmd::ConnectSecure { ssid, psk } => {
-                        info!(ssid, "connect requested (inline password)");
-                        guarded_connect!(ssid, client.connect_secure(&ssid, &psk));
+                        info!(ssid = %ssid.as_str(), "connect requested (inline password)");
+                        guarded_connect(ctx.clone(), ssid, ConnectKind::Secure(psk)).await;
                     }
                     state::BackendCmd::DisconnectActive => {
                         info!("disconnect requested");
-                        manual_disconnect.store(true, Ordering::Relaxed);
                         *last_manual_disconnect.lock().await = Some(std::time::Instant::now());
-                        guards.lock().await.clear();
-                        if let Err(e) = client.disconnect_active().await {
+                        if let Some(Err(e)) = with_bus_timeout(10, "disconnect", async {
+                            client.disconnect_active().await
+                        })
+                        .await
+                        {
                             tracing::warn!("disconnect failed: {e:#}");
                         }
                         settle!();
@@ -745,8 +1088,8 @@ async fn backend_main(
                         if let Err(e) = client.activate_vpn(&id).await {
                             tracing::warn!("activate vpn {id} failed: {e:#}");
                             let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: id.clone(),
-                                message: format!("Could not start VPN: {e:#}"),
+                                ssid: id.clone().into(),
+                                message: "Couldn't start VPN".into(),
                             });
                         }
                         settle!();
@@ -760,76 +1103,44 @@ async fn backend_main(
                     }
                     state::BackendCmd::ProvideSecret { ssid, path, psk } => {
                         info!(%ssid, %path, "retry password provided");
-                        if let Err(e) = nm_client::connect::validate_psk(&psk) {
+                        if let Err(e) = nm_client::connect::validate_psk(psk.as_str()) {
                             tracing::warn!("rejected invalid retry password for {path}: {e:#}");
-                        } else if !secrets.provide(&path, psk.clone()).await {
-
+                        } else if secrets.provide(&path, psk.to_string()).await {
+                            tracing::info!(%ssid, "live secret request answered");
+                        } else {
                             tracing::info!(%ssid, "no pending secret request; retrying profile");
-                            match client.connect_saved_with_psk(&ssid, &psk).await {
-                                Ok(created) => {
-                                    let client = client.clone();
-                                    let refresher = refresher.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_millis(1200))
-                                            .await;
-                                        let _ = client.refresh_model().await;
-                                        refresher.request(nm_client::signals::Cmd::Scan);
-                                    });
-                                    let _ = created;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%ssid, "saved retry failed: {e:#}");
-                                    let _ = model_feed.clone().try_send(state::UiEvent::SsidError {
-                                        ssid,
-                                        message: "Could not connect to this network".into(),
-                                    });
-                                }
-                            }
+                            guarded_connect(ctx.clone(), ssid, ConnectKind::RetrySaved(psk)).await;
                         }
+                        settle!();
                     }
                     state::BackendCmd::RetrySaved { ssid, psk, stale_path } => {
                         info!(%ssid, "retrying saved network with a new password");
                         if let Some(path) = stale_path {
-
                             secrets.cancel_path(&path).await;
                         }
-                        let prev = client
-                            .active_wifi_snapshot()
-                            .await
-                            .map(|(p, s)| nm_client::connect::PrevWifi {
-                                profile: p,
-                                ssid: s,
-                            });
-                        manual_disconnect.store(false, Ordering::Relaxed);
-                        match client.retry_saved_with_psk(&ssid, &psk).await {
-                            Ok(retry) => nm_client::connect::spawn_restore_guard(
-                                client.clone(),
-                                watch_rx.clone(),
-                                model_feed.clone(),
-                                nm_client::connect::GuardOpts {
-                                    target_ssid: ssid.clone(),
-                                    prev,
-                                    window: std::time::Duration::from_secs(30),
-                                    registry: guards.clone(),
-                                    created: retry.created,
-                                    manual: manual_disconnect.clone(),
-                                    rollback_psk: retry.rollback,
-                                },
-                            ),
-                            Err(e) => {
-                                tracing::warn!("saved retry failed: {e:#}");
-                                let _ = client.restore_previous(prev).await;
-                                let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                    ssid,
-                                    message: nm_client::connect::MSG_FAILED.into(),
-                                });
-                            }
+                        guarded_connect(ctx.clone(), ssid, ConnectKind::RetrySaved(psk)).await;
+                    }
+                    state::BackendCmd::CancelAttempt(ssid) => {
+                        info!(ssid = %ssid.as_str(), "cancelling stuck attempt after rejected password");
+                        if with_bus_timeout(10, "stuck-activation disposal", async {
+                            client.dispose_stuck_activation(ssid.as_str()).await
+                        })
+                        .await
+                        .unwrap_or(false)
+                        {
+                            tracing::info!(ssid = %ssid.as_str(), "stuck activation cancelled");
                         }
+                        settle!();
                     }
                     state::BackendCmd::CreateHotspot { ssid, psk } => {
-                        info!(ssid, "hotspot requested");
-                        match client.create_hotspot_with(&ssid, &psk).await {
-                            Ok(_created) => {
+                        info!(ssid = %ssid.as_str(), "hotspot requested");
+                        scan_frozen.store(true, Ordering::Relaxed);
+                        match with_bus_timeout(30, "hotspot creation", async {
+                            client.create_hotspot_with(ssid.as_str(), psk.as_str()).await
+                        })
+                        .await
+                        {
+                            Some(Ok(_created)) => {
                                 hotspot_expected.store(true, Ordering::Relaxed);
                                 tokio::spawn({
                                     let client = client.clone();
@@ -855,56 +1166,116 @@ async fn backend_main(
                                         let _ = client.stop_hotspot().await;
                                         hotspot_expected.store(false, Ordering::Relaxed);
                                         let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                            "Hotspot failed to start (this Wi-Fi driver did not bring up AP mode)".into(),
+                                            "Couldn't start hotspot".into(),
                                         ));
                                         refresher.request(nm_client::signals::Cmd::Refresh);
                                     }
                                 });
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 tracing::warn!("create_hotspot failed: {e:#}");
                                 let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                    format!("Could not start hotspot: {e:#}"),
+                                    "Couldn't start hotspot".into(),
+                                ));
+                            }
+                            None => {
+                                let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                    "Couldn't start hotspot".into(),
                                 ));
                             }
                         }
+                        scan_frozen.store(false, Ordering::Relaxed);
                         settle!();
                     }
                     state::BackendCmd::StopHotspot => {
                         info!("hotspot stop requested");
                         hotspot_expected.store(false, Ordering::Relaxed);
-                        if let Err(e) = client.stop_hotspot().await {
+                        if let Some(Err(e)) = with_bus_timeout(10, "hotspot stop", async {
+                            client.stop_hotspot().await
+                        })
+                        .await
+                        {
                             tracing::warn!("stop_hotspot failed: {e:#}");
                             let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                format!("Could not stop hotspot: {e:#}"),
+                                "Couldn't stop hotspot".into(),
                             ));
                         }
                         settle!();
                     }
                     state::BackendCmd::Forget(ssid) => {
-                        info!(ssid, "forget saved network requested");
-                        if let Err(e) = client.forget_saved(&ssid).await {
-                            tracing::warn!("forget {ssid} failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: ssid.clone(),
-                                message: format!("Could not forget: {e:#}"),
-                            });
+                        info!(ssid = %ssid.as_str(), "forget saved network requested");
+                        let paths = with_bus_timeout(10, "active-path lookup", async {
+                            client.active_paths_for_ssid(ssid.as_str()).await
+                        })
+                        .await
+                        .unwrap_or_default();
+                        for path in paths {
+                            secrets.cancel_path(&path.to_string()).await;
+                        }
+                        let nostuck = with_bus_timeout(10, "stuck-activation disposal", async {
+                            client.dispose_stuck_activation(ssid.as_str()).await
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if nostuck {
+                            tracing::info!(ssid = %ssid.as_str(), "cancelled a stuck activation for the forgotten network");
+                        }
+                        let cleaned = with_bus_timeout(10, "unsaved cleanup", async {
+                            client.delete_unsaved_for_ssid(ssid.as_str()).await
+                        })
+                        .await
+                        .unwrap_or(false);
+                        match with_bus_timeout(10, "profile deletion", async {
+                            client.forget_saved(ssid.as_str()).await
+                        })
+                        .await
+                        {
+                            Some(Ok(())) => tracing::info!(
+                                ssid = %ssid.as_str(),
+                                "saved profile deleted"
+                            ),
+                            _ => {
+                                let still_saved = with_bus_timeout(10, "saved lookup", async {
+                                    nm_client::saved_profile_path(
+                                        client.system_conn(),
+                                        ssid.as_str(),
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .is_some()
+                                })
+                                .await
+                                .unwrap_or(false);
+                                if still_saved {
+                                    tracing::warn!(
+                                        "forget {ssid} failed: saved profile remains"
+                                    );
+                                    let _ = model_feed.try_send(state::UiEvent::SsidError {
+                                        ssid: ssid.clone(),
+                                        message: "Couldn't forget this network".into(),
+                                    });
+                                } else if cleaned {
+                                    tracing::info!(
+                                        ssid = %ssid.as_str(),
+                                        "leftover unsaved profile removed"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        ssid = %ssid.as_str(),
+                                        "nothing to forget"
+                                    );
+                                }
+                            }
                         }
                         settle!();
                     }
                     state::BackendCmd::ConnectHidden { ssid, psk } => {
-                        info!(ssid, "hidden network connect requested");
-                        if let Err(e) = client.connect_hidden(&ssid, &psk).await {
-                            tracing::warn!("connect_hidden {ssid} failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: ssid.clone(),
-                                message: format!("Could not connect: {e:#}"),
-                            });
-                        }
-                        settle!();
+                        info!(ssid = %ssid.as_str(), "hidden network connect requested");
+                        guarded_connect(ctx.clone(), ssid, ConnectKind::Hidden(psk)).await;
                     }
                     state::BackendCmd::ExpandRow(ssid) => {
-                        info!(ssid, "expand row requested");
+                        info!(ssid = %ssid.as_str(), "expand row requested");
                         let _ = model_feed.try_send(state::UiEvent::ExpandRow(ssid));
                     }
                     state::BackendCmd::RefreshTray => {
@@ -917,11 +1288,14 @@ async fn backend_main(
         }
     }
     feed_task.abort();
-    refresher.stop();
-    if let Some(h) = tray_handle.get() {
-        h.shutdown().await;
+    tray_bridge.abort();
+    let _ = tray_bridge.await;
+    popup_manager.abort();
+    for handle in signal_watch {
+        handle.abort();
     }
-    let _ = quit_tx.try_send(());
+    refresher.stop();
+    tray_service.stop();
 }
 #[cfg(test)]
 mod tests {
@@ -942,6 +1316,7 @@ mod tests {
         assert!(validate_args(&a(&["--wifi", "off"])).is_ok());
         assert!(validate_args(&a(&["--camera-test"])).is_ok());
         assert!(validate_args(&a(&["--hotspot-test"])).is_ok());
+        assert!(validate_args(&a(&["--no-auto-failover"])).is_ok());
     }
     #[test]
     fn rejects_unknown_options() {
@@ -952,6 +1327,11 @@ mod tests {
     fn rejects_a_valued_flag_without_its_value() {
         assert!(validate_args(&a(&["--wifi"])).is_err());
         assert!(validate_args(&a(&["--connect-saved"])).is_err());
+    }
+    #[test]
+    fn foreign_pids_are_not_treated_as_ours() {
+        assert!(!process_is_rnetapplet(1));
+        assert!(!process_is_rnetapplet(u32::MAX));
     }
     #[test]
     fn does_not_treat_a_value_as_a_flag() {
