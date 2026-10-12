@@ -13,8 +13,6 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86_64
-          - runner: ubuntu-24.04-arm
-            arch: aarch64
     runs-on: ${{ matrix.runner }}
     container: archlinux:latest
     steps:
@@ -28,17 +26,40 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  check-arm:
+    if: "!contains(github.event.head_commit.message, 'skip ci')"
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential git \
+            pkg-config clang libgtk-4-dev libwayland-dev wayland-protocols \
+            meson ninja-build v4l-utils
+      - name: build gtk4-layer-shell from source
+        run: |
+          git clone --depth 1 https://github.com/wmww/gtk4-layer-shell.git \
+            /tmp/gtk4-layer-shell
+          meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
+            --prefix=/usr --buildtype=release
+          ninja -C /tmp/gtk4-layer-shell/build
+          sudo ninja -C /tmp/gtk4-layer-shell/build install
+          sudo ldconfig
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
   release:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'skip ci')
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: x86_64
-          - runner: ubuntu-24.04-arm
-            arch: aarch64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     container: archlinux:latest
     permissions:
       contents: write
@@ -68,8 +89,7 @@ jobs:
         if: steps.ver.outputs.bump == 'true'
         run: |
           VER="${{ steps.ver.outputs.version }}"
-          ARCH="${{ matrix.arch }}"
-          DIR="rnetapplet-$VER-$ARCH-linux"
+          DIR="rnetapplet-$VER-x86_64-linux"
           rm -rf "$DIR" "$DIR.tar.gz" "$DIR.tar.gz.sha256"
           mkdir "$DIR"
           install -Dm755 target/release/rnetapplet "$DIR/rnetapplet"
@@ -88,8 +108,78 @@ jobs:
           name: rnetapplet ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           files: |
-            rnetapplet-${{ steps.ver.outputs.version }}-${{ matrix.arch }}-linux.tar.gz
-            rnetapplet-${{ steps.ver.outputs.version }}-${{ matrix.arch }}-linux.tar.gz.sha256
+            rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz
+            rnetapplet-${{ steps.ver.outputs.version }}-x86_64-linux.tar.gz.sha256
+
+  release-arm:
+    needs: check-arm
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, 'skip ci')
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential git \
+            pkg-config clang libgtk-4-dev libwayland-dev wayland-protocols \
+            meson ninja-build v4l-utils
+      - name: build gtk4-layer-shell from source
+        run: |
+          git clone --depth 1 https://github.com/wmww/gtk4-layer-shell.git \
+            /tmp/gtk4-layer-shell
+          meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
+            --prefix=/usr --buildtype=release
+          ninja -C /tmp/gtk4-layer-shell/build
+          sudo ninja -C /tmp/gtk4-layer-shell/build install
+          sudo ldconfig
+      - uses: Swatinem/rust-cache@v2
+      - name: detect version bump
+        id: ver
+        run: |
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$VER" >/dev/null 2>&1; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: build release
+        if: steps.ver.outputs.bump == 'true'
+        run: cargo build --release
+      - name: package tarball
+        if: steps.ver.outputs.bump == 'true'
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          DIR="rnetapplet-$VER-aarch64-linux"
+          rm -rf "$DIR" "$DIR.tar.gz" "$DIR.tar.gz.sha256"
+          mkdir "$DIR"
+          install -Dm755 target/release/rnetapplet "$DIR/rnetapplet"
+          install -Dm644 packaging/rnetapplet.desktop "$DIR/rnetapplet.desktop"
+          install -Dm644 packaging/rnetapplet.service "$DIR/rnetapplet.service"
+          install -Dm644 README.md "$DIR/README.md"
+          install -Dm644 LICENSE-MIT "$DIR/LICENSE-MIT"
+          tar czf "$DIR.tar.gz" "$DIR"
+          (cd "$(dirname "$DIR.tar.gz")" && sha256sum "$(basename "$DIR.tar.gz")" > "$(basename "$DIR.tar.gz").sha256")
+          cat "$DIR.tar.gz.sha256"
+      - name: publish release
+        if: steps.ver.outputs.bump == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: rnetapplet ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            rnetapplet-${{ steps.ver.outputs.version }}-aarch64-linux.tar.gz
+            rnetapplet-${{ steps.ver.outputs.version }}-aarch64-linux.tar.gz.sha256
       - name: point install script at the new release
         if: steps.ver.outputs.bump == 'true'
         env:
