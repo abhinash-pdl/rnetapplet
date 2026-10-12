@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::nm_client::connect::MSG_WRONG_PASSWORD;
+use crate::state::MSG_WRONG_PASSWORD;
 use gtk4::gdk::Key;
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -80,6 +80,12 @@ window.rnet-window, window.rnet-window > .background, window.rnet-window:backdro
  .disconnect-label { color: @error_color; }
  .rnet-social-row { background-image: none; }
 .rnet-qr { padding-left: 10px; padding-right: 10px; }
+.rnet-hotspot-toggle { border-radius: 999px; padding: 0; }
+.rnet-hotspot-toggle.active {
+    background-color: alpha(@theme_selected_bg_color, 0.32);
+    color: @theme_selected_fg_color;
+    box-shadow: none;
+}
 .rnet-toolbar entry { min-height: 8px; padding-top: 0; padding-bottom: 0; }
 .rnet-window entry { caret-color: @theme_fg_color; }
 .rnet-window entry > text > selection { background-color: alpha(@theme_fg_color, 0.25); color: @theme_fg_color; }
@@ -366,11 +372,30 @@ pub fn run(
         air_row.append(&air_switch);
         toolbar.append(&air_row);
 
+        let wifi_want: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let air_want: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let arm_radio_timeout = |sw: &gtk4::Switch, want: &Rc<RefCell<Option<bool>>>| {
+            let sw_w = sw.downgrade();
+            let want2 = want.clone();
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(12), move || {
+                if want2.borrow().is_some() {
+                    *want2.borrow_mut() = None;
+                    if let Some(sw) = sw_w.upgrade() {
+                        sw.set_sensitive(true);
+                    }
+                }
+            });
+        };
         {
             let tx = cmd_tx.clone();
             let guard = prog_guard.clone();
-            wifi_switch.connect_state_set(move |_, state| {
-                if !guard.get() {
+            let want = wifi_want.clone();
+            let arm = arm_radio_timeout;
+            wifi_switch.connect_state_set(move |sw, state| {
+                if !guard.get() && want.borrow().is_none() {
+                    *want.borrow_mut() = Some(state);
+                    sw.set_sensitive(false);
+                    arm(sw, &want);
                     let _ = tx.try_send(BackendCmd::SetWifi(state));
                 }
                 gtk4::glib::Propagation::Proceed
@@ -379,8 +404,13 @@ pub fn run(
         {
             let tx = cmd_tx.clone();
             let guard = prog_guard.clone();
-            air_switch.connect_state_set(move |_, state| {
-                if !guard.get() {
+            let want = air_want.clone();
+            let arm = arm_radio_timeout;
+            air_switch.connect_state_set(move |sw, state| {
+                if !guard.get() && want.borrow().is_none() {
+                    *want.borrow_mut() = Some(state);
+                    sw.set_sensitive(false);
+                    arm(sw, &want);
                     let _ = tx.try_send(BackendCmd::SetAirplane(state));
                 }
                 gtk4::glib::Propagation::Proceed
@@ -399,6 +429,7 @@ pub fn run(
         hotspot_btn.set_focus_on_click(false);
         hotspot_btn.set_focusable(false);
         hotspot_btn.set_tooltip_text(Some("Hotspot"));
+        hotspot_btn.add_css_class("rnet-hotspot-toggle");
         toolbar.append(&hotspot_btn);
 
         let search = gtk4::SearchEntry::new();
@@ -538,6 +569,57 @@ pub fn run(
             let dirty = Rc::new(Cell::new(false));
             let queued = Rc::new(Cell::new(false));
             let last = Rc::new(Cell::new(0i64));
+            type RetrySlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+            let attempt: RetrySlot = Rc::new(RefCell::new(None));
+            let run_attempt = {
+                let card2 = card.clone();
+                let sc2 = sc.clone();
+                let dirty2 = dirty.clone();
+                let queued2 = queued.clone();
+                let last2 = last.clone();
+                let expanded3 = expanded2.clone();
+                let base3 = base2.clone();
+                let hidden_open2 = hidden_open.clone();
+                let hotspot_open2 = hotspot_open.clone();
+                let busy2 = busy.clone();
+                let size2 = size.clone();
+                let attempt2 = attempt.clone();
+                Rc::new(move || {
+                    queued2.set(false);
+                    if !dirty2.get() {
+                        return;
+                    }
+                    let now = motion::now_ms();
+                    if now < busy2.get() {
+                        let delay = (busy2.get() - now).max(0) as u64 + 30;
+                        if let Some(retry) = attempt2.borrow().clone() {
+                            gtk4::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(delay),
+                                move || {
+                                    retry();
+                                },
+                            );
+                        }
+                        return;
+                    }
+                    dirty2.set(false);
+                    let (_, measured, list_h) =
+                        measure_popup(&card2, &sc2, scale.get(), chrome.get());
+                    if expanded3.borrow().is_none() && !hidden_open2.get() && !hotspot_open2.get() {
+                        base3.set(list_h);
+                    }
+                    let (_, max_h, min_list) = scale_limits(scale.get());
+                    let want = measured.clamp(min_list + chrome.get(), max_h);
+                    let diff = want - size2.to.get();
+                    if diff.abs() < MIN_HEIGHT_JITTER {
+                        return;
+                    }
+                    size2.run(want);
+                    last2.set(motion::now_ms());
+                    tracing::debug!(diff, want, base = list_h, "popup refitted to rows");
+                })
+            };
+            *attempt.borrow_mut() = Some(run_attempt);
             Rc::new(move || {
                 if !shown.get() {
                     return;
@@ -547,44 +629,16 @@ pub fn run(
                     return;
                 }
                 queued.set(true);
-                let (card2, sc2) = (card.clone(), sc.clone());
-                let (dirty2, queued2, last2) = (dirty.clone(), queued.clone(), last.clone());
-                let (expanded3, base3) = (expanded2.clone(), base2.clone());
-                let (hidden_open2, hotspot_open2) = (hidden_open.clone(), hotspot_open.clone());
-                let (scale2, busy2, chrome2) = (scale.get(), busy.clone(), chrome.get());
-                let size2 = size.clone();
+                let now = motion::now_ms();
+                let wait = (motion::FIT_GAP_MS - (now - last.get())).max(0);
+                let attempt3 = attempt.clone();
                 gtk4::glib::idle_add_local_once(move || {
-                    let now = motion::now_ms();
-                    let wait = (motion::FIT_GAP_MS - (now - last2.get())).max(0);
                     gtk4::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(wait as u64),
                         move || {
-                            queued2.set(false);
-                            if !dirty2.get() {
-                                return;
+                            if let Some(run) = attempt3.borrow().clone() {
+                                run();
                             }
-
-                            if motion::now_ms() < busy2.get() {
-                                return;
-                            }
-                            dirty2.set(false);
-                            let (_, measured, list_h) =
-                                measure_popup(&card2, &sc2, scale2, chrome2);
-                            if expanded3.borrow().is_none()
-                                && !hidden_open2.get()
-                                && !hotspot_open2.get()
-                            {
-                                base3.set(list_h);
-                            }
-                            let (_, max_h, min_list) = scale_limits(scale2);
-                            let want = measured.clamp(min_list + chrome2, max_h);
-                            let diff = want - size2.to.get();
-                            if diff.abs() < MIN_HEIGHT_JITTER {
-                                return;
-                            }
-                            size2.run(want);
-                            last2.set(motion::now_ms());
-                            tracing::debug!(diff, want, base = list_h, "popup refitted to rows");
                         },
                     );
                 });
@@ -619,6 +673,8 @@ pub fn run(
             hotspot_card: hotspot_card.clone(),
             hotspot_ssid: hotspot_ssid.clone(),
             hotspot_psk: hotspot_psk.clone(),
+            hotspot_btn: hotspot_btn.clone(),
+            hotspot_pending: Rc::new(Cell::new(0)),
             speeds: speeds.clone(),
             speed_labels: speed_labels.clone(),
             revealers: revealers.clone(),
@@ -727,10 +783,15 @@ pub fn run(
         {
             let h = h.clone();
             hotspot_btn.connect_clicked(move |_| {
+                if h.hotspot_pending.get() != 0 {
+                    return;
+                }
                 let hs = h.model.borrow().hotspot.clone();
                 if hs.as_ref().is_some_and(|x| x.active) {
                     h.hotspot_error.borrow_mut().take();
+                    hotspot::set_hotspot_pending(&h, 2);
                     let _ = h.cmd_tx.try_send(BackendCmd::StopHotspot);
+                    refresh_list(&h);
                     return;
                 }
                 if let Some(cfg) = hs {
@@ -746,9 +807,15 @@ pub fn run(
                     } else {
                         draft_ssid.into()
                     };
-                    if !ssid.trim().is_empty() && (8..=63).contains(&psk.len()) {
+                    if !ssid.trim().is_empty()
+                        && ssid.trim().len() <= 32
+                        && psk.is_ascii()
+                        && (8..=63).contains(&psk.len())
+                    {
                         h.hotspot_error.borrow_mut().take();
+                        hotspot::set_hotspot_pending(&h, 1);
                         let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot { ssid, psk });
+                        refresh_list(&h);
                         return;
                     }
                 }
@@ -770,7 +837,7 @@ pub fn run(
                 if let Some(btn) = rescan_w.upgrade() {
                     btn.set_sensitive(false);
                     gtk4::glib::timeout_add_local_once(
-                        std::time::Duration::from_secs(2),
+                        std::time::Duration::from_secs(10),
                         move || btn.set_sensitive(true),
                     );
                 }
@@ -913,6 +980,8 @@ pub fn run(
             let wifi_icon = wifi_icon.clone();
             let air_icon = air_icon.clone();
             let prog_guard = prog_guard.clone();
+            let wifi_want = wifi_want.clone();
+            let air_want = air_want.clone();
             gtk4::glib::MainContext::default().spawn_local(async move {
                 while let Ok(ev) = ui_rx.recv().await {
                     match ev {
@@ -922,16 +991,34 @@ pub fn run(
                                 wifi_switch.set_active(m.wifi_enabled);
                                 prog_guard.set(false);
                             }
+                            if let Some(want) = wifi_want.borrow().as_ref()
+                                && *want == m.wifi_enabled
+                            {
+                                *wifi_want.borrow_mut() = None;
+                                wifi_switch.set_sensitive(true);
+                            }
                             if air_switch.state() != m.airplane_mode() {
                                 prog_guard.set(true);
                                 air_switch.set_active(m.airplane_mode());
                                 prog_guard.set(false);
+                            }
+                            if let Some(want) = air_want.borrow().as_ref()
+                                && *want == m.airplane_mode()
+                            {
+                                *air_want.borrow_mut() = None;
+                                air_switch.set_sensitive(true);
                             }
                             wifi_switch.set_sensitive(!m.airplane_mode());
                             if m.airplane_mode() && wifi_switch.state() {
                                 prog_guard.set(true);
                                 wifi_switch.set_active(false);
                                 prog_guard.set(false);
+                            }
+                            if wifi_want.borrow().is_some() {
+                                wifi_switch.set_sensitive(false);
+                            }
+                            if air_want.borrow().is_some() {
+                                air_switch.set_sensitive(false);
                             }
                             let wifi_on = m.wifi_enabled && !m.airplane_mode();
                             wifi_icon.set_icon_name(Some(&themed_icon(if wifi_on {
@@ -951,31 +1038,36 @@ pub fn run(
 
                             {
                                 let prev = h.model.borrow().active_ssid.clone();
-                                if prev.as_deref() != m.active_ssid.as_deref() {
+                                let hs_turned_on =
+                                    hs_active && !UiHandles::hotspot_active(&h.model.borrow());
+                                if prev.as_deref() != m.active_ssid.as_deref() && !hs_turned_on {
                                     let target = m.active_ssid.clone();
                                     let epoch = h.notify_gen.get() + 1;
                                     h.notify_gen.set(epoch);
                                     let h2 = h.clone();
-                                    gtk4::glib::timeout_add_local_once(
-                                        std::time::Duration::from_secs(3),
-                                        move || {
-                                            if h2.notify_gen.get() != epoch {
-                                                return;
-                                            }
-                                            let cur = h2.model.borrow().active_ssid.clone();
-                                            if cur != target {
-                                                return;
-                                            }
-                                            match target.as_deref() {
-                                                Some(ssid) => notify::send("Connected", ssid),
-                                                None => {
-                                                    if let Some(was) = prev.as_deref() {
-                                                        notify::send("Disconnected", was);
-                                                    }
+                                    let delay =
+                                        std::time::Duration::from_secs(if target.is_some() {
+                                            1
+                                        } else {
+                                            3
+                                        });
+                                    gtk4::glib::timeout_add_local_once(delay, move || {
+                                        if h2.notify_gen.get() != epoch {
+                                            return;
+                                        }
+                                        let cur = h2.model.borrow().active_ssid.clone();
+                                        if cur != target {
+                                            return;
+                                        }
+                                        match target.as_deref() {
+                                            Some(ssid) => notify::send("Connected", ssid),
+                                            None => {
+                                                if let Some(was) = prev.as_deref() {
+                                                    notify::send("Disconnected", was);
                                                 }
                                             }
-                                        },
-                                    );
+                                        }
+                                    });
                                 }
                             }
 
@@ -989,11 +1081,33 @@ pub fn run(
                             }
 
                             let was_active = UiHandles::hotspot_active(&h.model.borrow());
+                            if hs_active {
+                                h.hotspot_btn.add_css_class("active");
+                            } else {
+                                h.hotspot_btn.remove_css_class("active");
+                            }
+                            h.hotspot_btn.set_sensitive(h.hotspot_pending.get() == 0);
                             if hs_active && !was_active {
                                 h.hotspot_expanded.set(true);
+                                h.hotspot_btn.add_css_class("active");
+                                if h.hotspot_pending.get() == 1 {
+                                    h.hotspot_pending.set(0);
+                                }
+                                h.hotspot_btn.set_sensitive(true);
+                                if let Some(hs) = m.hotspot.as_ref() {
+                                    notify::send("Hotspot turned on", &hs.ssid.to_string());
+                                }
                             } else if was_active && !hs_active {
                                 h.hotspot_expanded.set(false);
                                 h.hotspot_error.borrow_mut().take();
+                                h.hotspot_btn.remove_css_class("active");
+                                if h.hotspot_pending.get() == 2 {
+                                    h.hotspot_pending.set(0);
+                                }
+                                h.hotspot_btn.set_sensitive(true);
+                                if let Some(hs) = h.model.borrow().hotspot.as_ref() {
+                                    notify::send("Hotspot turned off", &hs.ssid.to_string());
+                                }
                             }
 
                             if let Some(hs) = m.hotspot.as_ref() {
@@ -1060,11 +1174,25 @@ pub fn run(
                             }
                         }
                         UiEvent::BackendError(message) => {
-                            *h.hotspot_error.borrow_mut() = Some(message);
+                            let was_pending = h.hotspot_pending.get() != 0;
+                            h.hotspot_pending.set(0);
+                            h.hotspot_btn.set_sensitive(true);
+                            *h.hotspot_error.borrow_mut() = Some(message.clone());
+                            if was_pending {
+                                notify::send("Hotspot failed", &message);
+                            }
                             request_rebuild(&h);
                         }
                         UiEvent::ExpandRow(ssid) => {
                             row::set_expanded(&h, Some(&ssid));
+                        }
+                        UiEvent::VpnError { id, message } => {
+                            h.errors.borrow_mut().insert(id.clone().into(), message);
+                            request_rebuild(&h);
+                        }
+                        UiEvent::ClearConnecting(ssid) => {
+                            h.connecting.borrow_mut().remove(&ssid);
+                            row::set_row_connecting(&h, &ssid, false);
                         }
                         UiEvent::Speeds { up_bps, down_bps } => {
                             *h.speeds.borrow_mut() = (up_bps, down_bps);
@@ -1102,12 +1230,7 @@ pub fn run(
                     }
                     *h_open.expanded.borrow_mut() = None;
                     h_open.focus_ssid.borrow_mut().take();
-                    h_open.connecting.borrow_mut().clear();
                     h_open.errors.borrow_mut().clear();
-                    h_open.pw_drafts.borrow_mut().clear();
-                    h_open.pending_secret_paths.borrow_mut().clear();
-                    h_open.pw_attempt.borrow_mut().clear();
-                    h_open.unsaved_attempt.borrow_mut().clear();
                     h_open.hidden_expanded.set(false);
                     h_open.hidden_closing.set(false);
                     h_open.hidden_error.borrow_mut().take();

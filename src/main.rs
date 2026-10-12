@@ -1,17 +1,13 @@
 mod auto;
 mod nm_client;
-mod qr;
-mod qr_scan;
 mod secret_agent;
 mod state;
 mod tray;
-mod ui;
 use anyhow::Result;
-use gtk4::gio::prelude::FileExt as _;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::info;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HELP: &str = "rnetapplet — NetworkManager tray applet for wlroots compositors
@@ -19,9 +15,6 @@ USAGE:
     rnetapplet [FLAGS] [OPTIONS]
 FLAGS:
     --dump-aps            Print visible access points and exit
-    --camera-test         Probe the camera + QR decode path and exit
-    --scan-qr             Run the QR scanner window and print the result as JSON
-    --popup-child         Run the network popup window (spawned by the tray process)
     --hotspot-test        Create a hotspot, observe, stop it, restore Wi-Fi, exit
     --no-auto-failover    Do not nudge a saved network when connected but offline
     -h, --help            Print this help
@@ -64,9 +57,10 @@ fn claim_instance_lock() -> Result<()> {
             let pid = std::fs::read_to_string(&lock)
                 .map(|text| text.trim().to_string())
                 .unwrap_or_else(|_| "?".into());
-            anyhow::bail!(
+            eprintln!(
                 "another rnetapplet instance is already running (pid {pid}); refusing a second copy"
             );
+            std::process::exit(2);
         }
         let _ = std::fs::remove_file(&lock);
     }
@@ -87,7 +81,69 @@ async fn shutdown_signal() {
     }
 }
 
+fn purge_allocator_arenas() {
+    use tikv_jemalloc_ctl::{Access, AsName};
+    let nn: u32 = b"arenas.narenas\0".name().read().unwrap_or(0);
+    for i in 0..nn {
+        let pg = format!("arena.{i}.purge\0");
+        let _ = pg.as_bytes().name().write(0u64);
+    }
+}
+
+fn log_allocator_stats() {
+    use tikv_jemalloc_ctl::{Access, AsName};
+    let epoch: u64 = b"epoch\0".name().read().unwrap_or(0);
+    let _ = b"epoch\0".name().write(epoch);
+    let get = |key: &[u8]| -> u64 { key.name().read().map(|v: usize| v as u64).unwrap_or(0) };
+    tracing::info!(
+        allocated_kb = get(b"stats.allocated\0") / 1024,
+        active_kb = get(b"stats.active\0") / 1024,
+        metadata_kb = get(b"stats.metadata\0") / 1024,
+        resident_kb = get(b"stats.resident\0") / 1024,
+        mapped_kb = get(b"stats.mapped\0") / 1024,
+        retained_kb = get(b"stats.retained\0") / 1024,
+        "allocator stats"
+    );
+    let nn: u32 = b"arenas.narenas\0".name().read().unwrap_or(0);
+    for i in 0..nn {
+        let key = |tail: &str| format!("stats.arenas.{i}.{tail}\0");
+        let pa = get(key("pactive").as_bytes()) * 4096 / 1024;
+        let pd = get(key("pdirty").as_bytes()) * 4096 / 1024;
+        let pm = get(key("pmuzzy").as_bytes()) * 4096 / 1024;
+        if pa + pd + pm > 256 {
+            tracing::info!(
+                arena = i,
+                pactive_kb = pa,
+                pdirty_kb = pd,
+                pmuzzy_kb = pm,
+                "arena stats"
+            );
+        }
+    }
+}
+
+fn tune_allocator_return_memory() {
+    use tikv_jemalloc_ctl::{Access, AsName};
+    fn set_each_arena() {
+        let nn: u32 = b"arenas.narenas\0".name().read().unwrap_or(0);
+        for i in 0..nn {
+            let dd = format!("arena.{i}.dirty_decay_ms\0");
+            let mz = format!("arena.{i}.muzzy_decay_ms\0");
+            let pg = format!("arena.{i}.purge\0");
+            let _ = dd.as_bytes().name().write(250isize);
+            let _ = mz.as_bytes().name().write(0isize);
+            let _ = pg.as_bytes().name().write(0u64);
+        }
+    }
+    set_each_arena();
+    let _ = b"arenas.dirty_decay_ms\0".name().write(250isize);
+    let _ = b"arenas.muzzy_decay_ms\0".name().write(0isize);
+}
+
 fn main() -> Result<()> {
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
     if std::env::var_os("GSK_RENDERER").is_none() {
         unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
     }
@@ -98,6 +154,7 @@ fn main() -> Result<()> {
         )
         .with_ansi(false)
         .init();
+    tune_allocator_return_memory();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
@@ -144,8 +201,6 @@ fn main() -> Result<()> {
     let connect_saved = take_value(&args, "--connect-saved");
     let psk = take_value(&args, "--psk");
     let set_wifi = take_value(&args, "--wifi");
-    let camera_test = args.iter().any(|a| a == "--camera-test");
-    let scan_qr = args.iter().any(|a| a == "--scan-qr");
     let hotspot_test = args.iter().any(|a| a == "--hotspot-test");
     if let Some(v) = &set_wifi
         && v != "on"
@@ -153,27 +208,7 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--wifi expects on|off, got {v:?}");
     }
-    if dump
-        || connect_saved.is_some()
-        || set_wifi.is_some()
-        || camera_test
-        || hotspot_test
-        || scan_qr
-        || args.iter().any(|a| a == "--popup-child")
-    {
-        if camera_test {
-            return qr_scan::camera_self_test();
-        }
-        if scan_qr {
-            let parent = take_value(&args, "--parent-pid").and_then(|s| s.parse::<u32>().ok());
-            return qr_scan::scanner_child(parent);
-        }
-        if args.iter().any(|a| a == "--popup-child") {
-            let x = take_value(&args, "--popup-x").and_then(|s| s.parse::<i32>().ok());
-            let y = take_value(&args, "--popup-y").and_then(|s| s.parse::<i32>().ok());
-            let pos = x.zip(y);
-            return ui::child::run_popup_child(pos);
-        }
+    if dump || connect_saved.is_some() || set_wifi.is_some() || hotspot_test {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -228,29 +263,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 fn validate_args(args: &[String]) -> Result<()> {
-    const FLAGS: [&str; 13] = [
+    const FLAGS: [&str; 7] = [
         "--dump-aps",
         "--connect-saved",
         "--wifi",
         "--psk",
-        "--camera-test",
-        "--scan-qr",
-        "--parent-pid",
-        "--popup-child",
-        "--popup-x",
-        "--popup-y",
         "--hotspot-test",
         "--no-auto-failover",
         "--version",
     ];
-    const VALUED: [&str; 6] = [
-        "--connect-saved",
-        "--wifi",
-        "--psk",
-        "--parent-pid",
-        "--popup-x",
-        "--popup-y",
-    ];
+    const VALUED: [&str; 3] = ["--connect-saved", "--wifi", "--psk"];
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -345,7 +367,8 @@ async fn hotspot_test_run() -> Result<()> {
     let client = nm_client::NmClient::connect().await?;
     let before = client.active_ssid().await.unwrap_or(None);
     println!("before: active={}", before.as_deref().unwrap_or("(none)"));
-    let (ssid, psk) = client.create_hotspot().await?;
+    let started = client.create_hotspot().await?;
+    let (ssid, psk) = (started.ssid, started.psk);
     println!("hotspot created: ssid={ssid} psk={psk}");
     for i in 0..10 {
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -444,85 +467,7 @@ async fn dump_aps() -> Result<()> {
             if ap.saved { "[saved]" } else { "" },
         );
     }
-    audit_icons();
     Ok(())
-}
-fn audit_icons() {
-    if gtk4::init().is_err() {
-        println!("icons: no display, skipped");
-        return;
-    }
-    let Some(display) = gtk4::gdk::Display::default() else {
-        println!("icons: no display, skipped");
-        return;
-    };
-    let theme = gtk4::IconTheme::for_display(&display);
-    let theme_name = gtk4::Settings::default()
-        .and_then(|s| s.gtk_icon_theme_name())
-        .unwrap_or_default();
-    println!("icon-theme: {theme_name}");
-    for name in [
-        "network-wireless-signal-none-symbolic",
-        "network-wireless-signal-weak-symbolic",
-        "network-wireless-signal-ok-symbolic",
-        "network-wireless-signal-good-symbolic",
-        "network-wireless-signal-excellent-symbolic",
-        "network-wireless-disabled-symbolic",
-        "network-wireless-acquiring-symbolic",
-        "network-wireless-encrypted-symbolic",
-        "network-wireless-symbolic",
-        "network-wireless-hotspot-symbolic",
-        "network-wireless-offline-symbolic",
-        "network-wireless-disabled-symbolic",
-        "network-wireless-no-route-symbolic",
-        "network-wired-no-route-symbolic",
-        "network-wired-symbolic",
-        "network-offline-symbolic",
-        "network-error-symbolic",
-        "airplane-mode-symbolic",
-        "network-vpn-symbolic",
-        "pan-down-symbolic",
-        "pan-up-symbolic",
-        "scanner-symbolic",
-        "camera-photo-symbolic",
-        "list-add-symbolic",
-        "preferences-system-symbolic",
-        "go-previous-symbolic",
-        "view-pin-symbolic",
-        "system-shutdown-symbolic",
-    ] {
-        println!(
-            "  {:<45} {}",
-            name,
-            if theme.has_icon(name) {
-                "OK"
-            } else {
-                "MISSING"
-            }
-        );
-    }
-    println!("resolved files (size 24):");
-    for name in [
-        "network-wireless-signal-weak-symbolic",
-        "network-wireless-signal-ok-symbolic",
-        "network-wireless-signal-good-symbolic",
-        "network-wireless-signal-excellent-symbolic",
-    ] {
-        let path = theme
-            .lookup_icon(
-                name,
-                &[],
-                24,
-                1,
-                gtk4::TextDirection::Ltr,
-                gtk4::IconLookupFlags::empty(),
-            )
-            .file()
-            .and_then(|f| f.path())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "-".into());
-        println!("  {name:<45} {path}");
-    }
 }
 fn take_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -555,6 +500,12 @@ async fn backend_main(
         nm_client::signals::spawn_signal_watcher(client.clone(), Arc::downgrade(&refresher));
     let secrets = secret_agent::SecretStore::new();
     let hotspot_expected = Arc::new(AtomicBool::new(false));
+    let hotspot_busy = Arc::new(AtomicBool::new(false));
+    let hotspot_prev: Arc<tokio::sync::Mutex<Option<nm_client::hotspot::HotspotPrev>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let hotspot_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let radio_busy = Arc::new(AtomicBool::new(false));
     if let Err(e) = secret_agent::register(&client, secrets.clone(), model_feed.clone()).await {
         tracing::warn!("SecretAgent registration failed (inline passwords unavailable): {e:#}");
         for attempt in 1..=2 {
@@ -576,6 +527,7 @@ async fn backend_main(
         let model_feed = model_feed.clone();
         let secrets = secrets.clone();
         let refresher = refresher.clone();
+        let popup_visible = popup_visible.clone();
         async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -591,7 +543,8 @@ async fn backend_main(
                     info!(tasks, "backend heartbeat");
                 }
                 if ticks.is_multiple_of(20) {
-                    crate::ui::placement::trim_memory();
+                    purge_allocator_arenas();
+                    log_allocator_stats();
                 }
                 if client.nm.version().await.is_ok() {
                     if offline {
@@ -605,7 +558,9 @@ async fn backend_main(
                         }
                         refresher.request(nm_client::signals::Cmd::Scan);
                     }
-                    refresher.request(nm_client::signals::Cmd::Refresh);
+                    if popup_visible.load(Ordering::Relaxed) {
+                        refresher.request(nm_client::signals::Cmd::Refresh);
+                    }
                     continue;
                 }
                 if !offline {
@@ -758,8 +713,15 @@ async fn backend_main(
         pos: Option<(i32, i32)>,
     ) -> Option<PopupProc> {
         let exe = std::env::current_exe().ok()?;
-        let mut child = tokio::process::Command::new(exe);
+        let sibling = exe.parent().map(|d| d.join("rnetapplet-popup"));
+        let mut child = match sibling.filter(|p| p.is_file()) {
+            Some(path) => tokio::process::Command::new(path),
+            None => tokio::process::Command::new("rnetapplet-popup"),
+        };
         child.arg("--popup-child");
+        child.env("MALLOC_TRIM_THRESHOLD_", "65536");
+        child.env("MALLOC_MMAP_THRESHOLD_", "131072");
+        child.env("MALLOC_ARENA_MAX", "2");
         if let Some((x, y)) = pos {
             child
                 .arg("--popup-x")
@@ -789,6 +751,13 @@ async fn backend_main(
             }
         });
         let initial = state::UiEvent::Model(watch_rx.borrow().clone());
+        if let state::UiEvent::Model(m) = &initial {
+            tracing::info!(
+                hs_active = m.hotspot.as_ref().map(|h| h.active).unwrap_or(false),
+                aps = m.aps.len(),
+                "popup spawned with model"
+            );
+        }
         if write_event(&mut stdin, &initial).await.is_err() {
             return None;
         }
@@ -801,6 +770,7 @@ async fn backend_main(
         let popup_visible = popup_visible.clone();
         tokio::spawn(async move {
             let mut proc: Option<PopupProc> = None;
+            let mut last_popup_hs = false;
             loop {
                 if let Some(p) = proc.as_mut() {
                     match p.child.try_wait() {
@@ -827,6 +797,13 @@ async fn backend_main(
                     }
                     r = model_feed_rx.recv() => {
                         let Ok(ev) = r else { break };
+                        if let state::UiEvent::Model(m) = &ev {
+                            let hs = m.hotspot.as_ref().map(|h| h.active).unwrap_or(false);
+                            if hs != last_popup_hs {
+                                tracing::info!(hs_active = hs, "popup model hotspot flipped");
+                                last_popup_hs = hs;
+                            }
+                        }
                         if let Some(p) = proc.as_mut()
                             && write_event(&mut p.stdin, &ev).await.is_err()
                         {
@@ -845,6 +822,7 @@ async fn backend_main(
         refresher: refresher.clone(),
         secrets: secrets.clone(),
         scan_frozen: scan_frozen.clone(),
+        connect_epoch: Arc::new(AtomicU64::new(0)),
     };
     macro_rules! settle {
         () => {
@@ -874,6 +852,35 @@ async fn backend_main(
             }
         }
     }
+    async fn restore_hotspot_prev(
+        client: &nm_client::NmClient,
+        prev: &nm_client::hotspot::HotspotPrev,
+    ) -> bool {
+        if let Some(up) = client.active_ssid().await.unwrap_or(None) {
+            tracing::info!(ssid = %up.as_str(), "station already back after hotspot; leaving it");
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        if let Some(up) = client.active_ssid().await.unwrap_or(None) {
+            tracing::info!(ssid = %up.as_str(), "station already back after hotspot; leaving it");
+            return true;
+        }
+        for attempt in 1..=3 {
+            if client.reactivate_hotspot_prev(prev).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if client.active_ssid().await.unwrap_or(None).as_deref() == Some(prev.ssid.as_str())
+                {
+                    tracing::info!(ssid = %prev.ssid, "station restored after hotspot");
+                    return true;
+                }
+                tracing::warn!(ssid = %prev.ssid, attempt, "station reactivation did not land");
+            } else {
+                tracing::warn!(ssid = %prev.ssid, attempt, "station reactivation failed");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+        false
+    }
     #[derive(Clone)]
     struct ConnectCtx {
         client: Arc<nm_client::NmClient>,
@@ -882,6 +889,7 @@ async fn backend_main(
         refresher: Arc<nm_client::signals::Refresher>,
         secrets: Arc<secret_agent::SecretStore>,
         scan_frozen: Arc<AtomicBool>,
+        connect_epoch: Arc<AtomicU64>,
     }
     enum ConnectKind {
         Open,
@@ -891,6 +899,7 @@ async fn backend_main(
         Hidden(state::Secret),
     }
     async fn guarded_connect(ctx: ConnectCtx, ssid: state::Ssid, kind: ConnectKind) {
+        let mine = ctx.connect_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::info!(ssid = %ssid.as_str(), "connect started");
         ctx.scan_frozen.store(true, Ordering::Relaxed);
         let prev = with_bus_timeout(8, "previous-connection snapshot", async {
@@ -953,20 +962,31 @@ async fn backend_main(
                         &ctx.model_feed,
                         &ctx.watch_rx,
                         &refresh,
+                        &ctx.connect_epoch,
+                        mine,
                     )
                     .await;
             }
             Ok(Err(e)) => {
                 ctx.scan_frozen.store(false, Ordering::Relaxed);
                 tracing::warn!("connect {} failed: {e:#}", ssid);
-                if let Some(p) = prev
+                if ctx.connect_epoch.load(Ordering::Relaxed) != mine {
+                    tracing::info!(ssid = %ssid.as_str(), "superseded; skipping stale failure handling");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                if ctx.connect_epoch.load(Ordering::Relaxed) != mine
+                    || ctx.watch_rx.borrow().active_ssid.is_some()
+                {
+                    tracing::info!(ssid = %ssid.as_str(), "link already back; skipping restore");
+                } else if let Some(p) = prev
                     && p.ssid.as_str() != ssid.as_str()
                 {
                     let _ = ctx.client.reactivate_previous(&p.ssid, &p.profile).await;
                 }
                 let _ = ctx.model_feed.try_send(state::UiEvent::SsidError {
                     ssid: ssid.clone(),
-                    message: nm_client::connect::MSG_FAILED.into(),
+                    message: state::MSG_FAILED.into(),
                 });
             }
             Err(_) => {
@@ -977,320 +997,501 @@ async fn backend_main(
                     ctx.client.dispose_stuck_activation(ssid.as_str()),
                 )
                 .await;
-                if let Some(p) = prev
+                if ctx.connect_epoch.load(Ordering::Relaxed) != mine {
+                    tracing::info!(ssid = %ssid.as_str(), "superseded; skipping stale failure handling");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                if ctx.connect_epoch.load(Ordering::Relaxed) != mine
+                    || ctx.watch_rx.borrow().active_ssid.is_some()
+                {
+                    tracing::info!(ssid = %ssid.as_str(), "link already back; skipping restore");
+                } else if let Some(p) = prev
                     && p.ssid.as_str() != ssid.as_str()
                 {
                     let _ = ctx.client.reactivate_previous(&p.ssid, &p.profile).await;
                 }
                 let _ = ctx.model_feed.try_send(state::UiEvent::SsidError {
                     ssid: ssid.clone(),
-                    message: nm_client::connect::MSG_FAILED.into(),
+                    message: state::MSG_FAILED.into(),
                 });
             }
         }
-        ctx.scan_frozen.store(false, Ordering::Relaxed);
+        if ctx.connect_epoch.load(Ordering::Relaxed) == mine {
+            ctx.scan_frozen.store(false, Ordering::Relaxed);
+        }
         ctx.refresher.request(nm_client::signals::Cmd::Refresh);
     }
     let mut last_scan_done: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
-            _ = shutdown_signal() => {
-                info!("shutdown signal received");
-                break;
-            }
-            ev = tray_ev_rx.recv() => {
-                let cmd = match ev {
-                    Ok(cmd) => cmd,
-                    Err(_) => break,
-                };
-                match cmd {
-                    state::BackendCmd::Rescan => {
-                        let frozen = scan_frozen.load(Ordering::Relaxed);
-                        let fresh = last_scan_done.is_some_and(|t| {
-                            t.elapsed() < std::time::Duration::from_secs(30)
-                        });
-                        if !frozen && !fresh {
-                            let mut scanned =
-                                with_bus_timeout(20, "manual scan", scan_once_now(&client))
-                                    .await
-                                    .is_some_and(|ok| ok);
-                            if !scanned {
-                                tracing::info!(
-                                    "scan not accepted; retrying after the NM scan window"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(11)).await;
-                                scanned =
-                                    with_bus_timeout(20, "manual scan retry", scan_once_now(&client))
-                                        .await
-                                        .is_some_and(|ok| ok);
-                            }
-                            if scanned {
-                                last_scan_done = Some(std::time::Instant::now());
-                            } else {
-                                tracing::info!("manual scan did not run");
-                            }
-                        } else {
-                            refresher.request(nm_client::signals::Cmd::Scan);
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::Refresh => {
-                        refresher.request(nm_client::signals::Cmd::Refresh);
-                    }
-                    state::BackendCmd::SetWifi(on) => {
-                        info!(on, "Wi-Fi toggle requested");
-                        if let Some(Err(e)) = with_bus_timeout(10, "Wi-Fi toggle", async {
-                            client.set_wireless_enabled(on).await
-                        })
-                        .await
-                        {
-                            tracing::warn!("set_wireless_enabled failed: {e:#}");
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::SetAirplane(on) => {
-                        info!(on, "airplane mode requested");
-                        if let Some(Err(e)) = with_bus_timeout(10, "airplane toggle", async {
-                            client.set_airplane_mode(on).await
-                        })
-                        .await
-                        {
-                            tracing::warn!("set_airplane_mode failed: {e:#}");
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::ConnectOpen(ssid) => {
-                        info!(ssid = %ssid.as_str(), "connect requested (open)");
-                        guarded_connect(ctx.clone(), ssid, ConnectKind::Open).await;
-                    }
-                    state::BackendCmd::ConnectSaved(ssid) => {
-                        info!(ssid = %ssid.as_str(), "connect requested (saved profile)");
-                        guarded_connect(ctx.clone(), ssid, ConnectKind::Saved).await;
-                    }
-                    state::BackendCmd::ConnectSecure { ssid, psk } => {
-                        info!(ssid = %ssid.as_str(), "connect requested (inline password)");
-                        guarded_connect(ctx.clone(), ssid, ConnectKind::Secure(psk)).await;
-                    }
-                    state::BackendCmd::DisconnectActive => {
-                        info!("disconnect requested");
-                        *last_manual_disconnect.lock().await = Some(std::time::Instant::now());
-                        if let Some(Err(e)) = with_bus_timeout(10, "disconnect", async {
-                            client.disconnect_active().await
-                        })
-                        .await
-                        {
-                            tracing::warn!("disconnect failed: {e:#}");
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::ActivateVpn(id) => {
-                        info!(id, "vpn activate requested");
-                        if let Err(e) = client.activate_vpn(&id).await {
-                            tracing::warn!("activate vpn {id} failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                ssid: id.clone().into(),
-                                message: "Couldn't start VPN".into(),
-                            });
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::DeactivateVpn(id) => {
-                        info!(id, "vpn deactivate requested");
-                        if let Err(e) = client.deactivate_vpn(&id).await {
-                            tracing::warn!("deactivate vpn {id} failed: {e:#}");
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::ProvideSecret { ssid, path, psk } => {
-                        info!(%ssid, %path, "retry password provided");
-                        if let Err(e) = nm_client::connect::validate_psk(psk.as_str()) {
-                            tracing::warn!("rejected invalid retry password for {path}: {e:#}");
-                        } else if secrets.provide(&path, psk.to_string()).await {
-                            tracing::info!(%ssid, "live secret request answered");
-                        } else {
-                            tracing::info!(%ssid, "no pending secret request; retrying profile");
-                            guarded_connect(ctx.clone(), ssid, ConnectKind::RetrySaved(psk)).await;
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::RetrySaved { ssid, psk, stale_path } => {
-                        info!(%ssid, "retrying saved network with a new password");
-                        if let Some(path) = stale_path {
-                            secrets.cancel_path(&path).await;
-                        }
-                        guarded_connect(ctx.clone(), ssid, ConnectKind::RetrySaved(psk)).await;
-                    }
-                    state::BackendCmd::CancelAttempt(ssid) => {
-                        info!(ssid = %ssid.as_str(), "cancelling stuck attempt after rejected password");
-                        if with_bus_timeout(10, "stuck-activation disposal", async {
-                            client.dispose_stuck_activation(ssid.as_str()).await
-                        })
-                        .await
-                        .unwrap_or(false)
-                        {
-                            tracing::info!(ssid = %ssid.as_str(), "stuck activation cancelled");
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::CreateHotspot { ssid, psk } => {
-                        info!(ssid = %ssid.as_str(), "hotspot requested");
-                        scan_frozen.store(true, Ordering::Relaxed);
-                        match with_bus_timeout(30, "hotspot creation", async {
-                            client.create_hotspot_with(ssid.as_str(), psk.as_str()).await
-                        })
-                        .await
-                        {
-                            Some(Ok(_created)) => {
-                                hotspot_expected.store(true, Ordering::Relaxed);
-                                tokio::spawn({
-                                    let client = client.clone();
-                                    let refresher = refresher.clone();
-                                    let hotspot_expected = hotspot_expected.clone();
-                                    let model_feed = model_feed.clone();
-                                    async move {
-                                        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
-                                        if !hotspot_expected.load(Ordering::Relaxed) {
-                                            return;
-                                        }
-                                        let active = client
-                                            .refresh_model()
-                                            .await
-                                            .map(|m| {
-                                                m.hotspot.as_ref().map(|h| h.active).unwrap_or(false)
-                                            })
-                                            .unwrap_or(false);
-                                        if active {
-                                            return;
-                                        }
-                                        tracing::warn!("hotspot never activated; stopping it");
-                                        let _ = client.stop_hotspot().await;
-                                        hotspot_expected.store(false, Ordering::Relaxed);
+                                                            _ = shutdown_signal() => {
+                                                                info!("shutdown signal received");
+                                                                break;
+                                                            }
+                                                            ev = tray_ev_rx.recv() => {
+                                                                let cmd = match ev {
+                                                                    Ok(cmd) => cmd,
+                                                                    Err(_) => break,
+                                                                };
+                                                                match cmd {
+                                                                    state::BackendCmd::Rescan => {
+                                                                        let frozen = scan_frozen.load(Ordering::Relaxed);
+                                                                        let fresh = last_scan_done.is_some_and(|t| {
+                                                                            t.elapsed() < std::time::Duration::from_secs(30)
+                                                                        });
+                                                                        if !frozen && !fresh && !client.scan_completed_recently(30) {
+                                                                            let mut scanned =
+                                                                                with_bus_timeout(20, "manual scan", scan_once_now(&client))
+                                                                                    .await
+                                                                                    .is_some_and(|ok| ok);
+                                                                            if !scanned {
+                                                                                tracing::info!(
+                                                                                    "scan not accepted; retrying after the NM scan window"
+                                                                                );
+                                                                                tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+                                                                                if !client.scan_completed_recently(30) {
+                                                                                    scanned = with_bus_timeout(
+                                                                                        20,
+                                                                                        "manual scan retry",
+                                                                                        scan_once_now(&client),
+                                                                                    )
+                                                                                    .await
+                                                                                    .is_some_and(|ok| ok);
+                                                                                }
+                                                                            }
+                                                                            if scanned {
+                                                                                last_scan_done = Some(std::time::Instant::now());
+                                                                            } else {
+                                                                                tracing::info!("manual scan did not run");
+                                                                            }
+                                                                        } else {
+                                                                            refresher.request(nm_client::signals::Cmd::Scan);
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::Refresh => {
+                                                                        refresher.request(nm_client::signals::Cmd::Refresh);
+                                                                    }
+                                                                    state::BackendCmd::SetWifi(on) => {
+                                                                        info!(on, "Wi-Fi toggle requested");
+                                                                        if radio_busy.swap(true, Ordering::Relaxed) {
+                                                                            tracing::info!("radio already changing state; dropping duplicate toggle");
+                                                                        } else {
+                                                                            if let Some(Err(e)) = with_bus_timeout(10, "Wi-Fi toggle", async {
+                                                                                client.set_wireless_enabled(on).await
+                                                                            })
+                                                                            .await
+                                                                            {
+                                                                                tracing::warn!("set_wireless_enabled failed: {e:#}");
+                                                                            }
+                                                                            radio_busy.store(false, Ordering::Relaxed);
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::SetAirplane(on) => {
+                                                                        info!(on, "airplane mode requested");
+                                                                        if radio_busy.swap(true, Ordering::Relaxed) {
+                                                                            tracing::info!("radio already changing state; dropping duplicate toggle");
+                                                                        } else {
+                                                                            if let Some(Err(e)) = with_bus_timeout(10, "airplane toggle", async {
+                                                                                client.set_airplane_mode(on).await
+                                                                            })
+                                                                            .await
+                                                                            {
+                                                                                tracing::warn!("set_airplane_mode failed: {e:#}");
+                                                                            }
+                                                                            radio_busy.store(false, Ordering::Relaxed);
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::ConnectOpen(ssid) => {
+                                                                        info!(ssid = %ssid.as_str(), "connect requested (open)");
+                                                                        tokio::spawn(guarded_connect(ctx.clone(), ssid, ConnectKind::Open));
+                                                                    }
+                                                                    state::BackendCmd::ConnectSaved(ssid) => {
+                                                                        info!(ssid = %ssid.as_str(), "connect requested (saved profile)");
+                                                                        tokio::spawn(guarded_connect(ctx.clone(), ssid, ConnectKind::Saved));
+                                                                    }
+                                                                    state::BackendCmd::ConnectSecure { ssid, psk } => {
+                                                                        info!(ssid = %ssid.as_str(), "connect requested (inline password)");
+                                                                        tokio::spawn(guarded_connect(ctx.clone(), ssid, ConnectKind::Secure(psk)));
+                                                                    }
+                                                                    state::BackendCmd::DisconnectActive => {
+                                                                        info!("disconnect requested");
+                                                                        *last_manual_disconnect.lock().await = Some(std::time::Instant::now());
+                                                                        if let Some(Err(e)) = with_bus_timeout(10, "disconnect", async {
+                                                                            client.disconnect_active().await
+                                                                        })
+                                                                        .await
+                                                                        {
+                                                                            tracing::warn!("disconnect failed: {e:#}");
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::ActivateVpn(id) => {
+                                                                        info!(id, "vpn activate requested");
+                                                                        if let Err(e) = client.activate_vpn(&id).await {
+                                                                            tracing::warn!("activate vpn {id} failed: {e:#}");
+                                                                            let _ = model_feed.try_send(state::UiEvent::VpnError {
+                                                                                id: id.clone(),
+                                                                                message: "Couldn't start VPN".into(),
+                                                                            });
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::DeactivateVpn(id) => {
+                                                                        info!(id, "vpn deactivate requested");
+                                                                        if let Err(e) = client.deactivate_vpn(&id).await {
+                                                                            tracing::warn!("deactivate vpn {id} failed: {e:#}");
+                                                                            let _ = model_feed.try_send(state::UiEvent::VpnError {
+                                                                                id: id.clone(),
+                                                                                message: "Couldn't stop VPN".into(),
+                                                                            });
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::ProvideSecret { ssid, path, psk } => {
+                                                                        info!(%ssid, %path, "retry password provided");
+                                                                        if let Err(e) = nm_client::connect::validate_psk(psk.as_str()) {
+                                                                            tracing::warn!("rejected invalid retry password for {path}: {e:#}");
+                                                                        } else if secrets.provide(&path, psk.to_string()).await {
+                                                                            tracing::info!(%ssid, "live secret request answered");
+                                                                        } else {
+                                                                            tracing::info!(%ssid, "no pending secret request; retrying profile");
+                                                                            tokio::spawn(guarded_connect(ctx.clone(), ssid, ConnectKind::RetrySaved(psk)));
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::RetrySaved { ssid, psk, stale_path } => {
+                                                                        info!(%ssid, "retrying saved network with a new password");
+                                                                        if let Some(path) = stale_path {
+                                                                            secrets.forget_path(&path).await;
+                                                                        }
+                                                                        tokio::spawn(guarded_connect(ctx.clone(), ssid, ConnectKind::RetrySaved(psk)));
+                                                                    }
+                                                                    state::BackendCmd::CancelAttempt(ssid) => {
+                                                                        info!(ssid = %ssid.as_str(), "cancelling stuck attempt after rejected password");
+                                                                        if with_bus_timeout(10, "stuck-activation disposal", async {
+                                                                            client.dispose_stuck_activation(ssid.as_str()).await
+                                                                        })
+                                                                        .await
+                                                                        .unwrap_or(false)
+                                                                        {
+                                                                            tracing::info!(ssid = %ssid.as_str(), "stuck activation cancelled");
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                state::BackendCmd::CreateHotspot { ssid, psk } => {
+                                                        info!(ssid = %ssid.as_str(), "hotspot requested");
+                                                        if hotspot_busy.swap(true, Ordering::Relaxed) {
+                                                            tracing::info!("hotspot already changing state; dropping duplicate start");
+                                                        } else if client.hotspot_is_up().await {
+                                                            tracing::info!("hotspot already active; dropping duplicate start");
+                                                            hotspot_busy.store(false, Ordering::Relaxed);
+                                                            refresher.request(nm_client::signals::Cmd::Refresh);
+                                                        } else {
+                                                                            client
+                                                                                .set_hotspot_expected_ssid(Some(ssid.to_string()))
+                                                                                .await;
+                                                                            let prev = with_bus_timeout(8, "previous-connection snapshot", async {
+                                                                                let snap = client.active_wifi_snapshot().await;
+                                                                                let dev = client.wifi_device_path().await.ok().flatten();
+                                                                                match (snap, dev) {
+                                                                                    (Some((p, s)), Some(d)) => {
+                                                                                        Some(nm_client::hotspot::HotspotPrev {
+                                                                                            profile: p,
+                                                                                            ssid: s,
+                                                                                            device: d,
+                                                                                        })
+                                                                                    }
+                                                                                    _ => None,
+                                                                                }
+                                                                            })
+                                                                            .await
+                                                                            .flatten();
+                                                                            *hotspot_prev.lock().await = prev;
+                let task = tokio::spawn({
+                                                                        let client = client.clone();
+                                                                        let refresher = refresher.clone();
+                                                                        let hotspot_expected = hotspot_expected.clone();
+                                                                        let hotspot_busy = hotspot_busy.clone();
+                                                                        let hotspot_prev = hotspot_prev.clone();
+                                                                        let model_feed = model_feed.clone();
+                                                                        let scan_frozen = scan_frozen.clone();
+                                                                        let watch_tx = watch_tx.clone();
+                                                                        let watch_rx = watch_rx.clone();
+                                                                        async move {
+                                                                                    scan_frozen.store(true, Ordering::Relaxed);
+                                                                                    let outcome = with_bus_timeout(30, "hotspot creation", async {
+                                                                                        client.create_hotspot_with(ssid.as_str(), psk.as_str()).await
+                                                                                    })
+                                                                                    .await;
+                                                                                    let mut confirm = false;
+                                                                                    match outcome {
+                                                                                        Some(Ok(started)) => {
+        confirm = true;
+                                                                                    *hotspot_prev.lock().await = started.prev.clone();
+                                                                                    hotspot_expected.store(true, Ordering::Relaxed);
+                                                                                            {
+                                                                                                let base = watch_tx.borrow().clone();
+                                                                                                let mut m = (*base).clone();
+        m.hotspot = Some(state::HotspotInfo {
+                                                                                        ssid: started.ssid.clone().into(),
+                                                                                        psk: Some(state::Secret::from(started.psk.clone())),
+                                                                                        active: true,
+                                                                                        shared_radio: started.shared_radio,
+                                                                                    });
+                                                                                                m.aps = m.aps.iter().filter(|ap| ap.ssid.as_str() != started.ssid.as_str()).cloned().collect();
+                                                                                                if **watch_tx.borrow() != m {
+                                                                                                    let _ = watch_tx.send(Arc::new(m));
+                                                                                                }
+                                                                                            }
+                                                                                            if started.shared_radio {
+                                                                                                tracing::info!(
+                                                                                                    ssid = %started.ssid,
+                                                                                                    "hotspot shares the radio; station link will drop"
+                                                                                                );
+                                                                                            }                                                                    let client = client.clone();
+                                                                                            let refresher = refresher.clone();
+                                                                                            let hotspot_expected = hotspot_expected.clone();
+                                                                                            let model_feed = model_feed.clone();
+                                                                                            tokio::spawn(async move {
+                                                                                                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                                                                                                if !hotspot_expected.load(Ordering::Relaxed) {
+                                                                                                    return;
+                                                                                                }
+                                                                                                let active = client
+                                                                                                    .refresh_model()
+                                                                                                    .await
+                                                                                                    .map(|m| {
+                                                                                                        m.hotspot.as_ref().map(|h| h.active).unwrap_or(false)
+                                                                                                    })
+                                                                                                    .unwrap_or(false);
+                                                                                                if active {
+                                                                                                    return;
+                                                                                                }
+                                                                                                tracing::warn!("hotspot never activated; stopping it");
+                                                                                                let _ = client.stop_hotspot().await;
+                                                                                                hotspot_expected.store(false, Ordering::Relaxed);
+                                                                                                client.set_hotspot_expected_ssid(None).await;
+                                                                                                let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                                                                                    "Hotspot started but never became active".into(),
+                                                                                                ));
+                                                                                                refresher.request(nm_client::signals::Cmd::Refresh);
+                                                                                            });
+                                                                                        }
+                                                                                        Some(Err(e)) => {
+                                                                                            let msg = e.to_string();
+                                                                                            tracing::warn!("create_hotspot failed: {msg}");
+                                                                                            let prev = hotspot_prev.lock().await.clone();
+                                                                                            let restored = match prev {
+                                                                                                Some(ref p) => restore_hotspot_prev(&client, p).await,
+                                                                                                None => true,
+                                                                                            };
+                                        if restored {
+                                                                                        hotspot_prev.lock().await.take();
+                                                                                        let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                                                                            msg,
+                                                                                        ));
+                                                                                    } else {
+                                                                                        let ssid = prev.map(|p| p.ssid).unwrap_or_default();
+                                                                                        let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                                                                            format!("Hotspot failed ({msg}); couldn't restore {ssid}"),
+                                                                                        ));
+                                                                                    }
+                                                                                            client.set_hotspot_expected_ssid(None).await;
+                                                                                        }
+                                                                                        None => {
+                                                                                            tracing::warn!("hotspot creation timed out");
+                                                                                            let prev = hotspot_prev.lock().await.clone();
+                                                                                            let restored = match prev {
+                                                                                                Some(ref p) => restore_hotspot_prev(&client, p).await,
+                                                                                                None => true,
+                                                                                            };
+                                                                                            if restored {
+                                                                                                hotspot_prev.lock().await.take();
+                                                                                            }
+                                                                                            client.set_hotspot_expected_ssid(None).await;
+                                                                                            let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                                                                                "Hotspot start timed out".into(),
+                                                                                            ));
+                                                                                        }
+                                                                                    }
+                                                                                    scan_frozen.store(false, Ordering::Relaxed);
+                                                                                    hotspot_busy.store(false, Ordering::Relaxed);
+                                                                                    if confirm {
+                                                                                        for _ in 0..5 {
+                                                                                            refresher.request(nm_client::signals::Cmd::Refresh);
+                                                                                            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                                                                                            if watch_rx
+                                                                                                .borrow()
+                                                                                                .hotspot
+                                                                                                .as_ref()
+                                                                                                .map(|h| h.active)
+                                                                                                .unwrap_or(false)
+                                                                                            {
+                                                                                                break;
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            });
+                                                                            *hotspot_task.lock().await = Some(task);
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                        state::BackendCmd::StopHotspot => {
+                                                info!("hotspot stop requested");
+                                                hotspot_expected.store(false, Ordering::Relaxed);
+                                                client.set_hotspot_expected_ssid(None).await;
+                                                scan_frozen.store(false, Ordering::Relaxed);
+                                                                        let preempted = hotspot_task
+                                                                            .lock()
+                                                                            .await
+                                                                            .take()
+                                                                            .map(|h| h.abort())
+                                                                            .is_some();
+                                                                        if !preempted && hotspot_busy.swap(true, Ordering::Relaxed) {
+                                                                            tracing::info!("hotspot stop already running; dropping duplicate");
+                                                                        } else {
+                                                                            hotspot_busy.store(true, Ordering::Relaxed);
+                                                                            match with_bus_timeout(15, "hotspot stop", async {
+                                                                                client.stop_hotspot().await
+                                                                            })
+                                                                            .await
+                                                                            {
+                                        Some(Ok(())) => {
+                                                                            {
+                                                                                let base = watch_tx.borrow().clone();
+                                                                                let mut m = (*base).clone();
+                                                                                if let Some(hs) = m.hotspot.as_mut() {
+                                                                                    hs.active = false;
+                                                                                }
+                                                                                if **watch_tx.borrow() != m {
+                                                                                    let _ = watch_tx.send(Arc::new(m));
+                                                                                }
+                                                                            }
+                                                                            if let Some(prev) = hotspot_prev.lock().await.take()
+                                                                                && !restore_hotspot_prev(&client, &prev).await
+                                                                            {
+                                                                                let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                                                                    format!("Hotspot off — couldn't restore {}. Tap to reconnect.", prev.ssid),
+                                                                                ));
+                                                                            }
+                                                                        }
+                                                                                Some(Err(e)) => {
+                                                                                    let msg = e.to_string();
+                                                                                    tracing::warn!("stop_hotspot failed: {msg}");
                                         let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                            "Couldn't start hotspot".into(),
-                                        ));
-                                        refresher.request(nm_client::signals::Cmd::Refresh);
-                                    }
-                                });
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!("create_hotspot failed: {e:#}");
-                                let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                    "Couldn't start hotspot".into(),
-                                ));
-                            }
-                            None => {
-                                let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                    "Couldn't start hotspot".into(),
-                                ));
-                            }
-                        }
-                        scan_frozen.store(false, Ordering::Relaxed);
-                        settle!();
-                    }
-                    state::BackendCmd::StopHotspot => {
-                        info!("hotspot stop requested");
-                        hotspot_expected.store(false, Ordering::Relaxed);
-                        if let Some(Err(e)) = with_bus_timeout(10, "hotspot stop", async {
-                            client.stop_hotspot().await
-                        })
-                        .await
-                        {
-                            tracing::warn!("stop_hotspot failed: {e:#}");
-                            let _ = model_feed.try_send(state::UiEvent::BackendError(
-                                "Couldn't stop hotspot".into(),
-                            ));
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::Forget(ssid) => {
-                        info!(ssid = %ssid.as_str(), "forget saved network requested");
-                        let paths = with_bus_timeout(10, "active-path lookup", async {
-                            client.active_paths_for_ssid(ssid.as_str()).await
-                        })
-                        .await
-                        .unwrap_or_default();
-                        for path in paths {
-                            secrets.cancel_path(&path.to_string()).await;
-                        }
-                        let nostuck = with_bus_timeout(10, "stuck-activation disposal", async {
-                            client.dispose_stuck_activation(ssid.as_str()).await
-                        })
-                        .await
-                        .unwrap_or(false);
-                        if nostuck {
-                            tracing::info!(ssid = %ssid.as_str(), "cancelled a stuck activation for the forgotten network");
-                        }
-                        let cleaned = with_bus_timeout(10, "unsaved cleanup", async {
-                            client.delete_unsaved_for_ssid(ssid.as_str()).await
-                        })
-                        .await
-                        .unwrap_or(false);
-                        match with_bus_timeout(10, "profile deletion", async {
-                            client.forget_saved(ssid.as_str()).await
-                        })
-                        .await
-                        {
-                            Some(Ok(())) => tracing::info!(
-                                ssid = %ssid.as_str(),
-                                "saved profile deleted"
-                            ),
-                            _ => {
-                                let still_saved = with_bus_timeout(10, "saved lookup", async {
-                                    nm_client::saved_profile_path(
-                                        client.system_conn(),
-                                        ssid.as_str(),
-                                    )
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                                })
-                                .await
-                                .unwrap_or(false);
-                                if still_saved {
-                                    tracing::warn!(
-                                        "forget {ssid} failed: saved profile remains"
-                                    );
-                                    let _ = model_feed.try_send(state::UiEvent::SsidError {
-                                        ssid: ssid.clone(),
-                                        message: "Couldn't forget this network".into(),
-                                    });
-                                } else if cleaned {
-                                    tracing::info!(
-                                        ssid = %ssid.as_str(),
-                                        "leftover unsaved profile removed"
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        ssid = %ssid.as_str(),
-                                        "nothing to forget"
-                                    );
-                                }
-                            }
-                        }
-                        settle!();
-                    }
-                    state::BackendCmd::ConnectHidden { ssid, psk } => {
-                        info!(ssid = %ssid.as_str(), "hidden network connect requested");
-                        guarded_connect(ctx.clone(), ssid, ConnectKind::Hidden(psk)).await;
-                    }
-                    state::BackendCmd::ExpandRow(ssid) => {
-                        info!(ssid = %ssid.as_str(), "expand row requested");
-                        let _ = model_feed.try_send(state::UiEvent::ExpandRow(ssid));
-                    }
-                    state::BackendCmd::RefreshTray => {
-                        info!("theme change, re-emitting tray icon");
-                        refresher.request(nm_client::signals::Cmd::Refresh);
-                    }
-                    state::BackendCmd::Quit => break,
-                }
-            }
-        }
+                                                                                format!("Couldn't stop hotspot: {msg}"),
+                                                                            ));
+                                                                                }
+                                                                                None => {
+                                                                                    let _ = model_feed.try_send(state::UiEvent::BackendError(
+                                                                                        "Hotspot stop timed out".into(),
+                                                                                    ));
+                                                                                }
+                                                                            }
+                                                                            hotspot_busy.store(false, Ordering::Relaxed);
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::Forget(ssid) => {
+                                                                        info!(ssid = %ssid.as_str(), "forget saved network requested");
+                                                                        let paths = with_bus_timeout(10, "active-path lookup", async {
+                                                                            client.active_paths_for_ssid(ssid.as_str()).await
+                                                                        })
+                                                                        .await
+                                                                        .unwrap_or_default();
+                                                                        for path in &paths {
+                                                                            secrets.forget_path(&path.to_string()).await;
+                                                                            let _ = with_bus_timeout(10, "forget deactivate", async {
+                                                                                client.nm.deactivate_connection(path).await
+                                                                            })
+                                                                            .await;
+                                                                        }
+                                                                        let nostuck = with_bus_timeout(10, "stuck-activation disposal", async {
+                                                                            client.dispose_stuck_activation(ssid.as_str()).await
+                                                                        })
+                                                                        .await
+                                                                        .unwrap_or(false);
+                                                                        if nostuck {
+                                                                            tracing::info!(ssid = %ssid.as_str(), "cancelled a stuck activation for the forgotten network");
+                                                                        }
+                                                                        let cleaned = with_bus_timeout(10, "unsaved cleanup", async {
+                                                                            client.delete_unsaved_for_ssid(ssid.as_str()).await
+                                                                        })
+                                                                        .await
+                                                                        .unwrap_or(false);
+                                                                        match with_bus_timeout(10, "profile deletion", async {
+                                                                            client.forget_all_saved(ssid.as_str()).await
+                                                                        })
+                                                                        .await
+                                                                        {
+                                                                            Some(Ok(removed)) => tracing::info!(
+                                                                                ssid = %ssid.as_str(),
+                                                                                removed,
+                                                                                "saved profiles deleted"
+                                                                            ),
+                                                                            _ => {
+                                                                                let still_saved = with_bus_timeout(10, "saved lookup", async {
+                                                                                    nm_client::saved_profile_path(
+                                                                                        client.system_conn(),
+                                                                                        ssid.as_str(),
+                                                                                    )
+                                                                                    .await
+                                                                                    .ok()
+                                                                                    .flatten()
+                                                                                    .is_some()
+                                                                                })
+                                                                                .await
+                                                                                .unwrap_or(false);
+                                                                                if still_saved {
+                                                                                    tracing::warn!(
+                                                                                        "forget {ssid} failed: saved profile remains"
+                                                                                    );
+                                                                                    let _ = model_feed.try_send(state::UiEvent::SsidError {
+                                                                                        ssid: ssid.clone(),
+                                                                                        message: "Couldn't forget this network".into(),
+                                                                                    });
+                                                                                } else if cleaned {
+                                                                                    tracing::info!(
+                                                                                        ssid = %ssid.as_str(),
+                                                                                        "leftover unsaved profile removed"
+                                                                                    );
+                                                                                } else {
+                                                                                    tracing::debug!(
+                                                                                        ssid = %ssid.as_str(),
+                                                                                        "nothing to forget"
+                                                                                    );
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        settle!();
+                                                                    }
+                                                                    state::BackendCmd::ConnectHidden { ssid, psk } => {
+                                                                        info!(ssid = %ssid.as_str(), "hidden network connect requested");
+                                                                        tokio::spawn(guarded_connect(ctx.clone(), ssid, ConnectKind::Hidden(psk)));
+                                                                    }
+                                                                    state::BackendCmd::ExpandRow(ssid) => {
+                                                                        info!(ssid = %ssid.as_str(), "expand row requested");
+                                                                        let _ = model_feed.try_send(state::UiEvent::ExpandRow(ssid));
+                                                                    }
+                                                                    state::BackendCmd::RefreshTray => {
+                                                                        info!("theme change, re-emitting tray icon");
+                                                                        refresher.request(nm_client::signals::Cmd::Refresh);
+                                                                    }
+                                                                    state::BackendCmd::Quit => break,
+                                                                }
+                                                            }
+                                                        }
     }
     feed_task.abort();
     tray_bridge.abort();
     let _ = tray_bridge.await;
     popup_manager.abort();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client.stop_hotspot()).await;
     for handle in signal_watch {
         handle.abort();
     }
@@ -1314,9 +1515,11 @@ mod tests {
         assert!(validate_args(&a(&["--dump-aps"])).is_ok());
         assert!(validate_args(&a(&["--connect-saved", "Home"])).is_ok());
         assert!(validate_args(&a(&["--wifi", "off"])).is_ok());
-        assert!(validate_args(&a(&["--camera-test"])).is_ok());
         assert!(validate_args(&a(&["--hotspot-test"])).is_ok());
         assert!(validate_args(&a(&["--no-auto-failover"])).is_ok());
+        assert!(validate_args(&a(&["--camera-test"])).is_err());
+        assert!(validate_args(&a(&["--scan-qr"])).is_err());
+        assert!(validate_args(&a(&["--popup-child"])).is_err());
     }
     #[test]
     fn rejects_unknown_options() {

@@ -212,6 +212,13 @@ pub(crate) fn apply_model(h: &UiHandles, m: Arc<Model>) {
     }
     if h.refresh_blocked() {
         *h.pending_model.borrow_mut() = Some(m);
+        let h2 = h.clone();
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+            if h2.pending_model.borrow().is_none() || h2.refresh_blocked() || !h2.visible.get() {
+                return;
+            }
+            request_rebuild(&h2);
+        });
         return;
     }
     if !h.visible.get() {
@@ -430,9 +437,12 @@ pub(crate) fn refresh_list(h: &UiHandles) {
         h.list.append(&section_label("Wired"));
         h.list.append(&wired_row(wired, h));
     }
-
     if hotspot_shown(h) {
-        let (_, row) = ensure_hotspot_card(h);
+        let (rev, row) = ensure_hotspot_card(h);
+        let show = h.hotspot_expanded.get()
+            || UiHandles::hotspot_active(&h.model.borrow())
+            || h.hotspot_error.borrow().is_some();
+        rev.set_reveal_child(show);
         h.list.append(&row);
     }
 
@@ -482,20 +492,35 @@ pub(crate) fn refresh_list(h: &UiHandles) {
 
     let wifi_off = !m.wifi_enabled;
     let n_available = v.available.len();
+    let sharing = m
+        .hotspot
+        .as_ref()
+        .is_some_and(|hs| hs.active && hs.shared_radio);
     if wifi_off {
         h.list.append(&wifi_off_row(h, m.airplane_mode()));
     } else {
-        if n_available > 0 || v.active.is_none() {
+        if n_available > 0 || v.active.is_none() || sharing {
             h.list.append(&section_label("Available"));
         }
-        if n_available == 0 {
-            let l = gtk4::Label::new(Some("No networks found"));
+        if sharing {
+            let l = gtk4::Label::new(Some("Hotspot is on — networks unavailable while sharing"));
+            l.add_css_class("dim-label");
+            l.set_margin_top(16);
+            h.list.append(&l);
+        } else if n_available == 0 {
+            let l = gtk4::Label::new(Some(if m.scanning {
+                "Scanning for networks…"
+            } else if m.activating_ssid.is_some() {
+                "Connecting…"
+            } else {
+                "No networks found"
+            }));
             l.add_css_class("dim-label");
             l.set_margin_top(16);
             h.list.append(&l);
         }
     }
-    if !wifi_off {
+    if !wifi_off && !sharing {
         for ap in &v.available {
             let is_exp = exp.as_deref() == Some(ap.ssid.as_str());
             let err = errs.get(&ap.ssid).cloned();
@@ -773,6 +798,7 @@ mod tests {
             ssid: "Cafe".into(),
             psk: None,
             active: true,
+            shared_radio: false,
         });
         let v = visible(&m, "");
         assert!(v.active.is_none());

@@ -292,6 +292,9 @@ pub(crate) fn flash_error(h: &UiHandles, ssid: &Ssid, message: &str) {
     h.errors
         .borrow_mut()
         .insert(ssid.clone(), message.to_string());
+    if let Some(entry) = h.pw_entries.borrow().get(ssid) {
+        entry.set_visible(true);
+    }
     show_error_label(h, ssid, Some(message));
 }
 
@@ -375,11 +378,11 @@ pub(crate) fn mark_connecting(h: &UiHandles, ssid: &Ssid, with_password: bool, u
             let _ = h2.cmd_tx.try_send(BackendCmd::Forget(ssid.clone()));
         }
         if used_pw {
-            flash_error(&h2, &ssid, crate::nm_client::connect::MSG_WRONG_PASSWORD);
+            flash_error(&h2, &ssid, crate::state::MSG_WRONG_PASSWORD);
         } else {
             h2.errors
                 .borrow_mut()
-                .insert(ssid.clone(), crate::nm_client::connect::MSG_FAILED.into());
+                .insert(ssid.clone(), crate::state::MSG_FAILED.into());
             request_rebuild(&h2);
         }
     });
@@ -505,6 +508,7 @@ pub(crate) fn submit_password(h: &UiHandles, ssid: &Ssid, was_saved: bool) {
         return;
     }
     h.errors.borrow_mut().remove(ssid);
+    show_error_label(h, ssid, None);
 
     let stale_path = h.pending_secret_paths.borrow_mut().remove(ssid);
     let had_path = stale_path.is_some();
@@ -530,6 +534,8 @@ pub(crate) fn submit_password(h: &UiHandles, ssid: &Ssid, was_saved: bool) {
     mark_connecting(h, ssid, true, !was_saved && !had_path);
     let mut need_fit = false;
     if h.cmd_tx.try_send(cmd).is_err() {
+        h.connecting.borrow_mut().remove(ssid);
+        set_row_connecting(h, ssid, false);
         h.errors
             .borrow_mut()
             .insert(ssid.clone(), "Try again".into());
@@ -559,6 +565,9 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
     let saved = ap.saved;
     let h2 = h.clone();
     action_button_with("Connect", false, move || {
+        if h2.connecting.borrow().contains_key(&ssid) {
+            return;
+        }
         let typed = h2
             .pw_drafts
             .borrow()
@@ -576,6 +585,7 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
                 .is_err()
             {
                 tracing::warn!(ssid = %ssid.as_str(), "connect command dropped: backend channel full");
+                h2.connecting.borrow_mut().remove(&ssid);
                 set_row_connecting(&h2, &ssid, false);
             }
         } else if saved {
@@ -587,6 +597,7 @@ fn connect_action_button(ap: &Ap, h: &UiHandles) -> gtk4::Button {
                 .is_err()
             {
                 tracing::warn!(ssid = %ssid.as_str(), "connect-saved command dropped: backend channel full");
+                h2.connecting.borrow_mut().remove(&ssid);
                 set_row_connecting(&h2, &ssid, false);
             }
         } else if secured {
@@ -618,7 +629,7 @@ fn password_fields(
 ) -> gtk4::PasswordEntry {
     let entry = gtk4::PasswordEntry::new();
     entry.set_width_chars(12);
-    entry.set_show_peek_icon(false);
+    entry.set_show_peek_icon(true);
     entry.set_placeholder_text(Some("Password"));
     if let Some(draft) = h.pw_drafts.borrow().get(&ap.ssid) {
         entry.set_text(draft);
@@ -647,7 +658,7 @@ fn password_fields(
 
 fn register_pw_fields(h: &UiHandles, ap: &crate::state::Ap, entry: gtk4::PasswordEntry) {
     h.pw_entries.borrow_mut().insert(ap.ssid.clone(), entry);
-    update_connect_sensitivity(h, &ap.ssid, true);
+    update_connect_sensitivity(h, &ap.ssid, !ap.saved);
 }
 
 fn update_connect_sensitivity(h: &UiHandles, ssid: &Ssid, needs_password: bool) {
@@ -695,6 +706,9 @@ pub(crate) fn ap_row(
     let h2 = h.clone();
     let click = gtk4::GestureClick::new();
     click.connect_pressed(move |_, _, x, y| {
+        if h2.connecting.borrow().contains_key(&ssid) {
+            return;
+        }
         if let Some(vbox_g) = vbox_g.upgrade() {
             let target = vbox_g.pick(x, y, gtk4::PickFlags::DEFAULT);
             let Some(target) = target else { return };
@@ -834,6 +848,9 @@ pub(crate) fn ap_row(
         chev.set_focusable(false);
         chev.set_focus_on_click(false);
         chev.connect_clicked(move |_| {
+            if h2.connecting.borrow().contains_key(&ssid) {
+                return;
+            }
             let is_exp = h2.expanded.borrow().as_ref() == Some(&ssid);
             se(if is_exp { None } else { Some(ssid.clone()) });
         });
@@ -846,7 +863,6 @@ pub(crate) fn ap_row(
     details.set_margin_start(40);
     details.set_margin_end(12);
     details.set_margin_bottom(10);
-    let has_err = err.is_some();
 
     if is_active {
         if let Some(dev) = iface {
@@ -916,9 +932,10 @@ pub(crate) fn ap_row(
                 .insert(ap.ssid.clone(), el.clone());
             el
         };
-        let show_pw = ap.security.is_secured() && (!ap.saved || has_err);
+        let show_pw = ap.security.is_secured();
         if show_pw {
             let entry = password_fields(ap, h, &details, err_label);
+            entry.set_visible(!ap.saved || err.is_some());
             register_pw_fields(h, ap, entry);
         }
         if ap.saved {

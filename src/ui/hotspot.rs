@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 
 use super::list::refresh_list;
 use super::placement::open_editor;
-use super::row::{action_button, section_label};
+use super::row::{action_button_with, section_label};
 use super::state::UiHandles;
 use super::theme::themed_icon;
 use crate::state::BackendCmd;
@@ -20,6 +20,18 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
         el.add_css_class("error");
         el.set_wrap(true);
         vbox.append(&el);
+    }
+
+    let pending = h.hotspot_pending.get();
+    if pending != 0 {
+        let status = gtk4::Label::new(Some(if pending == 1 {
+            "Starting hotspot…"
+        } else {
+            "Stopping hotspot…"
+        }));
+        status.set_halign(gtk4::Align::Start);
+        status.add_css_class("dim-label");
+        vbox.append(&status);
     }
 
     let saved = h.model.borrow().hotspot.clone();
@@ -45,19 +57,57 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
         edit.set_tooltip_text(Some("Edit"));
         edit.connect_clicked(move |_| open_editor());
         hbox.append(&edit);
-        hbox.append(&action_button("Stop", true, BackendCmd::StopHotspot, h));
+        let stop = action_button_with("Stop", true, {
+            let h = h.clone();
+            move || {
+                if h.hotspot_pending.get() != 0 {
+                    return;
+                }
+                set_hotspot_pending(&h, 2);
+                if h.cmd_tx.try_send(BackendCmd::StopHotspot).is_err() {
+                    h.hotspot_pending.set(0);
+                    h.hotspot_btn.set_sensitive(true);
+                    *h.hotspot_error.borrow_mut() =
+                        Some("Couldn't reach backend; try again".into());
+                    refresh_list(&h);
+                }
+            }
+        });
+        stop.set_sensitive(pending == 0);
+        hbox.append(&stop);
         vbox.append(&hbox);
         if let Some(psk) = hs.psk.as_deref() {
-            let key = gtk4::Label::new(Some(&format!("Password: {psk}")));
-            key.set_halign(gtk4::Align::Start);
-            key.add_css_class("dim-label");
-            key.add_css_class("rnet-hotspot-key");
-            vbox.append(&key);
+            let key_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let caption = gtk4::Label::new(Some("Password:"));
+            caption.set_halign(gtk4::Align::Start);
+            caption.add_css_class("dim-label");
+            key_row.append(&caption);
+            let key = gtk4::PasswordEntry::new();
+            key.set_text(psk);
+            key.set_editable(false);
+            key.set_show_peek_icon(true);
+            key.set_hexpand(true);
+            key.set_halign(gtk4::Align::Fill);
+            key_row.append(&key);
+            vbox.append(&key_row);
         }
     } else {
         if h.hotspot_ssid.borrow().is_empty() {
             *h.hotspot_ssid.borrow_mut() = String::from("RnetHotspot");
         }
+        let uplink = if let Some(wired) = h.model.borrow().wired.clone() {
+            format!("Sharing via {}", wired.id)
+        } else if let Some(active) = UiHandles::active_ssid(&h.model.borrow()) {
+            format!("Note: starting will disconnect {active}")
+        } else {
+            "No internet connection to share".to_string()
+        };
+        let uplink_label = gtk4::Label::new(Some(&uplink));
+        uplink_label.set_halign(gtk4::Align::Start);
+        uplink_label.add_css_class("dim-label");
+        uplink_label.set_wrap(true);
+        vbox.append(&uplink_label);
+
         let ssid_entry = gtk4::Entry::new();
         ssid_entry.set_placeholder_text(Some("Name"));
         ssid_entry.set_text(&h.hotspot_ssid.borrow().clone());
@@ -66,7 +116,7 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
 
         let pass_entry = gtk4::PasswordEntry::new();
         pass_entry.set_width_chars(12);
-        pass_entry.set_show_peek_icon(false);
+        pass_entry.set_show_peek_icon(true);
         pass_entry.set_placeholder_text(Some("Password"));
         pass_entry.set_text(&h.hotspot_psk.borrow().clone());
         UiHandles::track_entry(&h.hotspot_entries, &pass_entry.clone().upcast());
@@ -78,7 +128,9 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
         cancel.add_css_class("flat");
         let start = gtk4::Button::with_label("Start");
         start.set_sensitive(
-            !ssid_entry.text().trim().is_empty() && (8..=63).contains(&pass_entry.text().len()),
+            pending == 0
+                && !ssid_entry.text().trim().is_empty()
+                && (8..=63).contains(&pass_entry.text().len()),
         );
         btn_row.append(&cancel);
         btn_row.append(&start);
@@ -132,6 +184,9 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
             let ssid_w = ssid_entry.downgrade();
             let pass_w = pass_entry.downgrade();
             start.connect_clicked(move |btn| {
+                if h.hotspot_pending.get() != 0 {
+                    return;
+                }
                 let Some(ssid_entry) = ssid_w.upgrade() else {
                     return;
                 };
@@ -145,8 +200,20 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                     refresh_list(&h);
                     return;
                 }
+                if ssid.len() > 32 {
+                    *h.hotspot_error.borrow_mut() =
+                        Some("Hotspot name is too long (32-byte limit)".into());
+                    refresh_list(&h);
+                    return;
+                }
                 if !(8..=63).contains(&psk.len()) {
                     *h.hotspot_error.borrow_mut() = Some("Password must be 8-63 characters".into());
+                    refresh_list(&h);
+                    return;
+                }
+                if !psk.is_ascii() {
+                    *h.hotspot_error.borrow_mut() =
+                        Some("Password must use ASCII characters".into());
                     refresh_list(&h);
                     return;
                 }
@@ -154,11 +221,22 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
                 *h.hotspot_ssid.borrow_mut() = ssid.clone();
                 *h.hotspot_psk.borrow_mut() = psk.clone();
                 btn.grab_focus();
-                collapse_hotspot(&h);
-                let _ = h.cmd_tx.try_send(BackendCmd::CreateHotspot {
-                    ssid: ssid.into(),
-                    psk: psk.into(),
-                });
+                btn.set_sensitive(false);
+                set_hotspot_pending(&h, 1);
+                if h.cmd_tx
+                    .try_send(BackendCmd::CreateHotspot {
+                        ssid: ssid.into(),
+                        psk: psk.into(),
+                    })
+                    .is_err()
+                {
+                    h.hotspot_pending.set(0);
+                    h.hotspot_btn.set_sensitive(true);
+                    btn.set_sensitive(true);
+                    *h.hotspot_error.borrow_mut() =
+                        Some("Couldn't reach backend; try again".into());
+                }
+                refresh_list(&h);
             });
         }
     }
@@ -167,6 +245,21 @@ pub(crate) fn hotspot_section_row(h: &UiHandles) -> gtk4::ListBoxRow {
     row.set_child(Some(&vbox));
     row.set_activatable(false);
     row
+}
+
+pub(crate) fn set_hotspot_pending(h: &UiHandles, value: u8) {
+    h.hotspot_pending.set(value);
+    h.hotspot_btn.set_sensitive(value == 0);
+    if value != 0 {
+        let h2 = h.clone();
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(90), move || {
+            if h2.hotspot_pending.get() == value {
+                h2.hotspot_pending.set(0);
+                h2.hotspot_btn.set_sensitive(true);
+                refresh_list(&h2);
+            }
+        });
+    }
 }
 
 pub(crate) fn hotspot_shown(h: &UiHandles) -> bool {

@@ -33,10 +33,12 @@ impl Bands {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_5_or_6(self) -> bool {
         self.0 & (Self::B5G.0 | Self::B6G.0) != 0
     }
 
+    #[allow(dead_code)]
     pub fn label(self) -> String {
         let mut parts: Vec<&str> = Vec::with_capacity(3);
         if self.0 & Self::B2G.0 != 0 {
@@ -68,10 +70,12 @@ impl Security {
         !matches!(self, Self::Open)
     }
 
+    #[allow(dead_code)]
     pub fn is_wep(self) -> bool {
         matches!(self, Self::Wep)
     }
 
+    #[allow(dead_code)]
     pub fn is_enterprise(self) -> bool {
         matches!(self, Self::Enterprise)
     }
@@ -114,6 +118,7 @@ pub fn is_wep_only(flags: u32, wpa_flags: u32, rsn_flags: u32) -> bool {
     wpa_flags == 0 && rsn_flags == 0 && flags & AP_FLAGS_PRIVACY != 0
 }
 
+#[allow(dead_code)]
 pub fn is_enterprise(wpa_flags: u32, rsn_flags: u32) -> bool {
     wpa_flags & AP_SEC_KEY_MGMT_802_1X != 0 || rsn_flags & AP_SEC_KEY_MGMT_802_1X != 0
 }

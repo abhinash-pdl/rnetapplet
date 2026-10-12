@@ -1,10 +1,11 @@
 use super::NmClient;
 use super::uncached_proxy;
 use crate::secret_agent::SecretStore;
-use crate::state::{ModelRx, Secret, Ssid, UiEvent};
+use crate::state::{MSG_FAILED, MSG_WRONG_PASSWORD, ModelRx, Secret, Ssid, UiEvent};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use zbus::zvariant::{OwnedObjectPath, Value};
 pub fn open_profile<'a>(ssid: &'a str) -> HashMap<&'a str, HashMap<&'a str, Value<'a>>> {
@@ -74,12 +75,43 @@ pub struct PrevWifi {
     pub ssid: String,
 }
 
-pub const MSG_FAILED: &str = "Couldn't connect";
-pub const MSG_WRONG_PASSWORD: &str = "Incorrect password";
+async fn active_reason(conn: &zbus::Connection, path: &OwnedObjectPath) -> Option<u32> {
+    use zbus::fdo::PropertiesProxy;
+    let iface =
+        zbus::names::InterfaceName::try_from("org.freedesktop.NetworkManager.Connection.Active")
+            .ok()?;
+    let proxy = PropertiesProxy::builder(conn)
+        .destination("org.freedesktop.NetworkManager")
+        .ok()?
+        .path(path.clone())
+        .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    let all = proxy.get_all(iface).await.ok()?;
+    all.get("Reason").and_then(|v| u32::try_from(v).ok())
+}
+
+fn reason_message(reason: Option<u32>, wrong_password: bool) -> Option<String> {
+    if wrong_password {
+        return Some(MSG_WRONG_PASSWORD.into());
+    }
+    match reason {
+        Some(10) => Some(MSG_WRONG_PASSWORD.into()),
+        Some(9) => Some("Password required".into()),
+        Some(6) => Some("Connection timed out".into()),
+        Some(5) => Some("Couldn't get an IP address".into()),
+        Some(8) => Some("Couldn't start network service".into()),
+        Some(11) | Some(12) => Some("Connection disappeared; try again".into()),
+        Some(2) => None,
+        _ => Some(MSG_FAILED.into()),
+    }
+}
 
 const WATCH_POLL: Duration = Duration::from_millis(400);
 const WATCH_WINDOW: Duration = Duration::from_secs(20);
-const QUIET_BEFORE_RETRY: Duration = Duration::from_secs(2);
+const QUIET_BEFORE_RETRY: Duration = Duration::from_secs(8);
 const REACTIVATE_TRIES: u32 = 3;
 const REACTIVATE_LAND_WINDOW: Duration = Duration::from_secs(8);
 
@@ -401,13 +433,20 @@ impl NmClient {
         }
         removed
     }
-    pub async fn forget_saved(&self, ssid: &str) -> Result<()> {
-        let path = super::saved_profile_path(self.system_conn(), ssid)
-            .await?
-            .with_context(|| format!("no saved profile for {ssid}"))?;
-        self.delete_profile(&path).await?;
-        tracing::info!(ssid, %path, "saved profile deleted");
-        Ok(())
+    pub async fn forget_all_saved(&self, ssid: &str) -> Result<usize> {
+        let mut removed = 0;
+        for _ in 0..8 {
+            let Some(path) = super::saved_profile_path(self.system_conn(), ssid).await? else {
+                break;
+            };
+            self.delete_profile(&path).await?;
+            removed += 1;
+        }
+        if removed == 0 {
+            anyhow::bail!("no saved profile for {ssid}");
+        }
+        tracing::info!(ssid, removed, "saved profiles deleted");
+        Ok(removed)
     }
     pub async fn connect_saved(&self, ssid: &str) -> Result<ConnectOutcome> {
         let profile = super::saved_profile_path(self.system_conn(), ssid)
@@ -441,6 +480,7 @@ impl NmClient {
             .with_context(|| format!("no saved profile for {ssid}"))?;
         secrets.clear_served(&profile.to_string()).await;
         secrets.provide(&profile.to_string(), psk.to_string()).await;
+        self.dispose_stuck_activation(ssid).await;
         tracing::info!(
             ssid,
             %profile,
@@ -637,14 +677,30 @@ impl NmClient {
         ssid: &Ssid,
         window: Duration,
     ) -> bool {
-        let deadline = tokio::time::Instant::now() + window;
+        let mut deadline = tokio::time::Instant::now() + window;
         let mut errors = 0u32;
+        let mut extended = false;
         loop {
             match self.current_active_state(path).await {
                 Ok(2) => return true,
                 Ok(4) | Ok(5) => return false,
-                Ok(_) => {
+                Ok(state) => {
                     errors = 0;
+                    if tokio::time::Instant::now() >= deadline {
+                        if state == 1 && !extended {
+                            extended = true;
+                            deadline =
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                            tracing::info!(
+                                ssid = %ssid.as_str(), %path,
+                                "activation still progressing; extending window once"
+                            );
+                            continue;
+                        }
+                        tracing::warn!(ssid = %ssid.as_str(), %path, "activation window elapsed; cancelling stale attempt");
+                        self.dispose_stuck_activation(ssid.as_str()).await;
+                        return false;
+                    }
                 }
                 Err(_) => {
                     errors += 1;
@@ -653,12 +709,12 @@ impl NmClient {
                         self.dispose_stuck_activation(ssid.as_str()).await;
                         return false;
                     }
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(ssid = %ssid.as_str(), %path, "activation window elapsed; cancelling stale attempt");
+                        self.dispose_stuck_activation(ssid.as_str()).await;
+                        return false;
+                    }
                 }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(ssid = %ssid.as_str(), %path, "activation window elapsed; cancelling stale attempt");
-                self.dispose_stuck_activation(ssid.as_str()).await;
-                return false;
             }
             tokio::time::sleep(WATCH_POLL).await;
         }
@@ -679,10 +735,36 @@ impl NmClient {
         feed: &async_channel::Sender<UiEvent>,
         watch_rx: &ModelRx,
         refresh: &Arc<dyn Fn() + Send + Sync>,
+        epoch: &Arc<AtomicU64>,
+        mine: u64,
     ) {
+        let current = || epoch.load(Ordering::Relaxed) == mine;
         tracing::info!(ssid = %target.as_str(), %active, "watching activation state");
-        let landed = self.poll_active_state(active, target, WATCH_WINDOW).await;
+        let watch_path = commit.clone().map(|p| p.to_string());
+        let mut wrong_password = false;
+        let landed = tokio::select! {
+            r = self.poll_active_state(active, target, WATCH_WINDOW) => r,
+            _ = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    if let Some(path) = watch_path.as_deref()
+                        && secrets.rejected(path).await
+                    {
+                        break;
+                    }
+                }
+            } => {
+                wrong_password = true;
+                self.dispose_stuck_activation(target.as_str()).await;
+                false
+            }
+        };
         if landed {
+            if !current() {
+                tracing::info!(ssid = %target.as_str(), "superseded by newer attempt; standing down");
+                refresh();
+                return;
+            }
             if let Some(path) = &commit
                 && let Some(secret) = secrets.take_served_psk(&path.to_string()).await
             {
@@ -709,10 +791,23 @@ impl NmClient {
             return;
         }
         tracing::info!(ssid = %target.as_str(), "connect attempt failed");
-        let _ = feed.try_send(UiEvent::SsidError {
-            ssid: target.clone(),
-            message: MSG_FAILED.into(),
-        });
+        if !current() {
+            tracing::info!(ssid = %target.as_str(), "superseded; skipping stale failure handling");
+            let _ = feed.try_send(UiEvent::ClearConnecting(target.clone()));
+            return;
+        }
+        let reason = active_reason(self.system_conn(), active).await;
+        match reason_message(reason, wrong_password) {
+            Some(message) => {
+                let _ = feed.try_send(UiEvent::SsidError {
+                    ssid: target.clone(),
+                    message,
+                });
+            }
+            None => {
+                let _ = feed.try_send(UiEvent::ClearConnecting(target.clone()));
+            }
+        }
         refresh();
         if let Some(path) = &commit {
             secrets.clear_served(&path.to_string()).await;
@@ -728,6 +823,10 @@ impl NmClient {
         if let Some(p) = prev.filter(|p| p.ssid.as_str() != target.as_str()) {
             let start = std::time::Instant::now();
             while start.elapsed() < QUIET_BEFORE_RETRY {
+                if !current() {
+                    tracing::info!(ssid = %target.as_str(), "superseded during rollback wait");
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let active = watch_rx.borrow().active_ssid.clone();
                 match active.as_deref() {
@@ -739,6 +838,10 @@ impl NmClient {
                 }
             }
             for attempt in 1..=REACTIVATE_TRIES {
+                if !current() {
+                    tracing::info!(ssid = %target.as_str(), "superseded; aborting rollback");
+                    return;
+                }
                 if watch_rx.borrow().active_ssid.is_some() {
                     return;
                 }
@@ -778,7 +881,7 @@ impl NmClient {
                     }
                 }
             }
-            if watch_rx.borrow().active_ssid.is_none() {
+            if watch_rx.borrow().active_ssid.is_none() && current() {
                 let _ = feed.try_send(UiEvent::SsidError {
                     ssid: Ssid::from(p.ssid.clone()),
                     message: "Couldn't reconnect".into(),

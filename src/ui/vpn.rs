@@ -38,13 +38,22 @@ pub(crate) fn vpn_row(vpn: &VpnConnection, h: &UiHandles) -> gtk4::ListBoxRow {
     let btn = gtk4::Button::with_label(if active { "Disconnect" } else { "Connect" });
     btn.add_css_class("flat");
     btn.set_halign(gtk4::Align::End);
+    let btn_w = btn.downgrade();
     btn.connect_clicked(move |_| {
         let cmd = if active {
             BackendCmd::DeactivateVpn(id.clone())
         } else {
             BackendCmd::ActivateVpn(id.clone())
         };
-        let _ = tx.try_send(cmd);
+        if tx.try_send(cmd).is_err() {
+            return;
+        }
+        if let Some(btn) = btn_w.upgrade() {
+            btn.set_sensitive(false);
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(10), move || {
+                btn.set_sensitive(true);
+            });
+        }
     });
     hbox.append(&btn);
     vbox.append(&hbox);

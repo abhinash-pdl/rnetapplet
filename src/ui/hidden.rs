@@ -38,7 +38,7 @@ pub(crate) fn hidden_form_row(h: &UiHandles) -> gtk4::ListBoxRow {
 
     let pass_entry = gtk4::PasswordEntry::new();
     pass_entry.set_width_chars(12);
-    pass_entry.set_show_peek_icon(false);
+    pass_entry.set_show_peek_icon(true);
     pass_entry.set_placeholder_text(Some("Password"));
     UiHandles::track_entry(&h.hidden_entries, &pass_entry.clone().upcast());
     let motion_pass = gtk4::EventControllerMotion::new();

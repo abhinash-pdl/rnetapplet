@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 const MIN_REFRESH_GAP: Duration = Duration::from_millis(1500);
-const MIN_REFRESH_GAP_VISIBLE: Duration = Duration::from_millis(50);
+const MIN_REFRESH_GAP_VISIBLE: Duration = Duration::from_millis(1000);
 const DEBOUNCE: Duration = Duration::from_millis(200);
 const DEBOUNCE_FAST: Duration = Duration::from_millis(60);
 const SETTLE: Duration = Duration::from_millis(150);
@@ -106,6 +106,7 @@ async fn refresh_loop(
     let mut last_scan_req = tokio::time::Instant::now()
         .checked_sub(SCAN_MIN_INTERVAL * 2)
         .unwrap_or_else(tokio::time::Instant::now);
+    kick_scan(&client, &pending, &mut last_scan_req).await;
     loop {
         let is_visible = visible.load(Ordering::Relaxed);
         let period = if is_visible {
@@ -206,7 +207,10 @@ async fn paint(client: &NmClient, out: &ModelTx, what: &str) {
     }
 }
 
-fn keep_over(current: &Model, next: &Model) -> bool {
+fn keep_over(current: &Model, next: &Model, settling: bool) -> bool {
+    if settling && !next.aps.is_empty() && next.aps.len() < current.aps.len() {
+        return false;
+    }
     if !next.aps.is_empty() || current.aps.is_empty() {
         return true;
     }
@@ -215,12 +219,52 @@ fn keep_over(current: &Model, next: &Model) -> bool {
         || next.nm_online != current.nm_online
 }
 
+fn meta_changed(current: &Model, next: &Model) -> bool {
+    let mut probe = next.clone();
+    probe.aps = current.aps.clone();
+    *current != probe
+}
+
+fn settle_merge(current: &Model, next: Model) -> Model {
+    use std::collections::HashMap;
+    let mut union: HashMap<crate::state::Ssid, crate::state::Ap> = HashMap::new();
+    for ap in current.aps.iter() {
+        union.insert(ap.ssid.clone(), ap.clone());
+    }
+    for ap in next.aps.iter() {
+        union.insert(ap.ssid.clone(), ap.clone());
+    }
+    let mut aps: Vec<crate::state::Ap> = union.into_values().collect();
+    crate::state::sort_aps(&mut aps);
+    Model {
+        aps: aps.into(),
+        ..next
+    }
+}
+
 async fn crawl(client: &NmClient, out: &ModelTx) {
     let t0 = std::time::Instant::now();
     match client.refresh_model().await {
         Ok(model) => {
-            if !keep_over(&out.borrow(), &model) {
-                tracing::debug!("dropping empty crawl over populated list");
+            let settling = client.scan_inflight();
+            if !keep_over(&out.borrow(), &model, settling) {
+                if settling && meta_changed(&out.borrow(), &model) {
+                    let merged = settle_merge(&out.borrow(), model);
+                    if **out.borrow() == merged {
+                        tracing::debug!("settled merge matches current; skipping publish");
+                        return;
+                    }
+                    tracing::debug!(
+                        aps = merged.aps.len(),
+                        "publishing settled merge over shrunken crawl"
+                    );
+                    if tx_outdated(out, &merged) {
+                        info!(aps = merged.aps.len(), "NM model refreshed");
+                    }
+                    let _ = out.send(Arc::new(merged));
+                    return;
+                }
+                tracing::debug!("dropping unsettled crawl over populated list");
                 return;
             }
             if **out.borrow() == model {
@@ -271,7 +315,13 @@ async fn crawl_settled(client: &NmClient, out: &ModelTx) {
 }
 
 fn tx_outdated(out: &ModelTx, model: &Model) -> bool {
-    out.borrow().aps.len() != model.aps.len()
+    let cur = out.borrow();
+    if cur.aps.len() != model.aps.len() {
+        return true;
+    }
+    let cur_hs = cur.hotspot.as_ref().map(|h| h.active).unwrap_or(false);
+    let next_hs = model.hotspot.as_ref().map(|h| h.active).unwrap_or(false);
+    cur_hs != next_hs
 }
 async fn scan_once(client: &NmClient) {
     tracing::debug!("scan requested");
@@ -470,7 +520,8 @@ mod tests {
     fn empty_crawl_never_clobbers_a_populated_list() {
         let current = ap_model(&["Home", "Cafe"]);
         let empty = ap_model(&[]);
-        assert!(!keep_over(&current, &empty));
+        assert!(!keep_over(&current, &empty, false));
+        assert!(!keep_over(&current, &empty, true));
     }
 
     #[test]
@@ -478,16 +529,59 @@ mod tests {
         let current = ap_model(&["Home"]);
         let mut off = ap_model(&[]);
         off.wifi_enabled = false;
-        assert!(keep_over(&current, &off));
+        assert!(keep_over(&current, &off, false));
         let mut offline = ap_model(&[]);
         offline.nm_online = false;
-        assert!(keep_over(&current, &offline));
+        assert!(keep_over(&current, &offline, true));
     }
 
     #[test]
     fn empty_over_empty_and_non_empty_over_anything_are_kept() {
-        assert!(keep_over(&ap_model(&[]), &ap_model(&[])));
-        assert!(keep_over(&ap_model(&["A"]), &ap_model(&["A", "B"])));
-        assert!(keep_over(&ap_model(&[]), &ap_model(&["A"])));
+        assert!(keep_over(&ap_model(&[]), &ap_model(&[]), false));
+        assert!(keep_over(&ap_model(&["A"]), &ap_model(&["A", "B"]), false));
+        assert!(keep_over(&ap_model(&[]), &ap_model(&["A"]), false));
+    }
+
+    #[test]
+    fn shrunken_crawl_is_dropped_while_a_scan_settles() {
+        let full = ap_model(&["A", "B", "C"]);
+        let partial = ap_model(&["A"]);
+        assert!(!keep_over(&full, &partial, true));
+        assert!(keep_over(&full, &partial, false));
+    }
+
+    #[test]
+    fn grown_or_equal_crawl_is_kept_while_a_scan_settles() {
+        let full = ap_model(&["A", "B", "C"]);
+        assert!(keep_over(&full, &ap_model(&["A", "B", "C", "D"]), true));
+        assert!(keep_over(&full, &full.clone(), true));
+        assert!(keep_over(&ap_model(&[]), &ap_model(&["A"]), true));
+    }
+
+    #[test]
+    fn meta_changed_ignores_ap_rows() {
+        let a = ap_model(&["A", "B"]);
+        let mut b = ap_model(&["A"]);
+        assert!(!meta_changed(&a, &b));
+        b = ap_model(&["A", "B"]);
+        assert!(!meta_changed(&a, &b));
+        let mut c = ap_model(&["A", "B"]);
+        c.no_internet = true;
+        assert!(meta_changed(&a, &c));
+    }
+
+    #[test]
+    fn settle_merge_unions_rows_and_takes_fresh_metadata() {
+        let mut current = ap_model(&["A", "B", "C"]);
+        let mut next = ap_model(&["A"]);
+        next.no_internet = true;
+        let merged = settle_merge(&current, next.clone());
+        let mut got: Vec<String> = merged.aps.iter().map(|ap| ap.ssid.to_string()).collect();
+        got.sort();
+        assert_eq!(got, vec!["A", "B", "C"]);
+        assert!(merged.no_internet);
+        current.no_internet = true;
+        let same = settle_merge(&current, next.clone());
+        assert!(!meta_changed(&current, &same));
     }
 }

@@ -82,10 +82,24 @@ pub async fn saved_profile_path(
 }
 pub async fn hotspot_profile_path(conn: &zbus::Connection) -> Result<Option<OwnedObjectPath>> {
     let loaded = load_wireless_settings(conn, wireless_profile_paths(conn).await).await;
-    Ok(loaded
-        .into_iter()
-        .find(|(_, m)| is_hotspot_profile(m))
-        .map(|(p, _)| p))
+    let mut fallback = None;
+    for (path, map) in loaded {
+        if !is_hotspot_profile(&map) {
+            continue;
+        }
+        let ours = map
+            .get("connection")
+            .and_then(|c| c.get("id"))
+            .map(|v| matches!(&**v, Value::Str(s) if s.as_str() == super::hotspot::HOTSPOT_CONN_ID))
+            .unwrap_or(false);
+        if ours {
+            return Ok(Some(path));
+        }
+        if fallback.is_none() {
+            fallback = Some(path);
+        }
+    }
+    Ok(fallback)
 }
 pub async fn delete_all_hotspot_profiles_except(
     conn: &zbus::Connection,

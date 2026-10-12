@@ -8,6 +8,7 @@ use tokio::sync::watch;
 pub struct Ssid(String);
 
 impl Ssid {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -60,6 +61,7 @@ impl std::borrow::Borrow<str> for Ssid {
 pub struct Secret(String);
 
 impl Secret {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -121,6 +123,7 @@ pub struct HotspotInfo {
     pub ssid: Ssid,
     pub psk: Option<Secret>,
     pub active: bool,
+    pub shared_radio: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiredInfo {
@@ -147,6 +150,7 @@ pub struct Model {
     pub nm_online: bool,
     pub no_internet: bool,
     pub primary_wired: bool,
+    pub scanning: bool,
     pub vpn_connections: Arc<[VpnConnection]>,
     pub last_good: Option<Ssid>,
 }
@@ -161,9 +165,11 @@ impl Model {
             ..Default::default()
         }
     }
+    #[allow(dead_code)]
     pub fn airplane_mode(&self) -> bool {
         !self.networking_enabled
     }
+    #[allow(dead_code)]
     pub fn active_strength(&self) -> Option<u8> {
         let ssid = self.active_ssid.as_deref()?;
         self.aps
@@ -172,11 +178,16 @@ impl Model {
             .map(|ap| ap.strength)
     }
 }
+#[allow(dead_code)]
 pub type ModelTx = watch::Sender<Arc<Model>>;
+#[allow(dead_code)]
 pub type ModelRx = watch::Receiver<Arc<Model>>;
+#[allow(dead_code)]
 pub fn channel() -> (ModelTx, ModelRx) {
     watch::channel(Arc::new(Model::empty()))
 }
+pub const MSG_FAILED: &str = "Couldn't connect";
+pub const MSG_WRONG_PASSWORD: &str = "Incorrect password";
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BackendCmd {
     Rescan,
@@ -228,6 +239,11 @@ pub enum UiEvent {
         ssid: Ssid,
         message: String,
     },
+    VpnError {
+        id: String,
+        message: String,
+    },
+    ClearConnecting(Ssid),
     SecretsNeeded {
         ssid: Ssid,
         path: String,
@@ -249,6 +265,7 @@ pub fn sort_aps(aps: &mut [Ap]) {
     });
 }
 
+#[allow(dead_code)]
 pub fn format_rate(bps: Option<u64>) -> String {
     match bps {
         None => String::from("…"),

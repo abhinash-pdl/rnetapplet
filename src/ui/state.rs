@@ -47,6 +47,8 @@ pub(crate) struct UiHandles {
     pub hotspot_expanded: Rc<Cell<bool>>,
     pub hotspot_ssid: Rc<RefCell<String>>,
     pub hotspot_psk: Rc<RefCell<String>>,
+    pub hotspot_btn: gtk4::Button,
+    pub hotspot_pending: Rc<Cell<u8>>,
     pub speeds: Rc<RefCell<(Option<u64>, Option<u64>)>>,
     pub speed_labels: Rc<RefCell<Option<(gtk4::Label, gtk4::Label)>>>,
     pub revealers: Rc<RefCell<HashMap<Ssid, gtk4::Revealer>>>,
@@ -298,6 +300,7 @@ pub(crate) fn shell_equivalent(a: &Model, b: &Model) -> bool {
         && UiHandles::hotspot_active(a) == UiHandles::hotspot_active(b)
         && a.hotspot.as_ref().map(|h| (&h.ssid, &h.psk))
             == b.hotspot.as_ref().map(|h| (&h.ssid, &h.psk))
+        && (a.scanning == b.scanning || (!a.aps.is_empty() && !b.aps.is_empty()))
 }
 
 pub(crate) fn ap_layout_key(ap: &crate::state::Ap) -> (Security, bool, i32) {
@@ -451,6 +454,7 @@ mod tests {
                 ssid: "H".into(),
                 psk: Some("oldpass".into()),
                 active: true,
+                shared_radio: false,
             }),
             ..model(vec![])
         };
@@ -459,6 +463,7 @@ mod tests {
                 ssid: "H".into(),
                 psk: Some("newpass".into()),
                 active: true,
+                shared_radio: false,
             }),
             ..model(vec![])
         };

@@ -14,6 +14,7 @@ pub(crate) struct Decider {
     attempts: u32,
     blocked_until: Option<Instant>,
     unhealthy_since: Option<Instant>,
+    last_active: Option<Ssid>,
 }
 
 impl Decider {
@@ -38,6 +39,10 @@ impl Decider {
         if !m.no_internet {
             self.reset();
             return None;
+        }
+        if m.active_ssid != self.last_active {
+            self.last_active = m.active_ssid.clone();
+            self.unhealthy_since = Some(now);
         }
         let since = *self.unhealthy_since.get_or_insert(now);
         if now.duration_since(since) < SUSTAINED_OUTAGE {
@@ -287,6 +292,7 @@ mod tests {
                 ssid: "Rnet".into(),
                 psk: None,
                 active: true,
+                shared_radio: false,
             });
             m
         };

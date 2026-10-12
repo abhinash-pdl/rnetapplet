@@ -189,11 +189,21 @@ async fn device_speed(client: &NmClient, path: Option<OwnedObjectPath>) -> Optio
 }
 
 pub async fn hotspot_status(client: &NmClient) -> Result<Option<HotspotInfo>> {
-    if let Some((_profile, map)) = super::active_hotspot_profile(client.system_conn()).await? {
-        let from_map = map
+    let mut active = super::active_hotspot_profile(client.system_conn()).await?;
+    if active.is_none() && client.hotspot_expected().await.is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        active = super::active_hotspot_profile(client.system_conn()).await?;
+    }
+    if let Some((_profile, map)) = active {
+        let mut from_map = map
             .get("802-11-wireless")
             .and_then(|w| w.get("ssid"))
             .and_then(super::bytes_to_ssid);
+        if from_map.is_none()
+            && let Ok(Some((saved, _))) = client.saved_hotspot_config().await
+        {
+            from_map = Some(saved);
+        }
         let ssid = Ssid::from(from_map.unwrap_or_else(|| "hotspot".into()));
         let psk: Option<Secret> = map
             .get("802-11-wireless-security")
@@ -207,13 +217,19 @@ pub async fn hotspot_status(client: &NmClient) -> Result<Option<HotspotInfo>> {
             ssid,
             psk,
             active: true,
+            shared_radio: client.active_wifi_snapshot().await.is_none(),
         }));
+    }
+    if client.hotspot_expected().await.is_some() {
+        let actives = client.describe_wifi_actives().await;
+        tracing::info!(?actives, "hotspot expected but active profile not found");
     }
     if let Ok(Some((ssid, psk))) = client.saved_hotspot_config().await {
         return Ok(Some(HotspotInfo {
             ssid: ssid.into(),
             psk: psk.map(Secret::from),
             active: false,
+            shared_radio: false,
         }));
     }
     Ok(None)

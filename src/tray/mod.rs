@@ -412,6 +412,7 @@ mod tests {
             ssid: "Phone".into(),
             psk: None,
             active: true,
+            shared_radio: false,
         });
         assert_eq!(icon_for(&m), "network-wireless-hotspot-symbolic");
         assert_eq!(tooltip_text(&m), "Hotspot active");

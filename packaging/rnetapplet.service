@@ -9,6 +9,7 @@ PartOf=graphical-session.target
 ExecStart=/usr/bin/rnetapplet
 Restart=on-failure
 RestartSec=3
+RestartPreventExitStatus=2
 Environment=RUST_BACKTRACE=1
 
 [Install]

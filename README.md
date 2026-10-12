@@ -107,6 +107,7 @@ echo "1bbaf596e1a8798b8262b77bbead1bfe0282c2033e38eabc6e048e8b1edea3cb  rnetappl
 tar xzf rnetapplet.tar.gz
 cd rnetapplet-1.0.0-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
+sudo install -Dm755 rnetapplet-popup /usr/bin/rnetapplet-popup
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
 ```
@@ -118,10 +119,12 @@ its own `.sha256` file).
 ### cargo
 
 ```sh
-cargo install --git https://github.com/abhinash-pdl/rnetapplet
+cargo install --git https://github.com/abhinash-pdl/rnetapplet --features popup
 ```
 
-The binary lands in `~/.cargo/bin/rnetapplet`.
+Both binaries land in `~/.cargo/bin/` (`rnetapplet` and
+`rnetapplet-popup`); the popup feature is required or the tray has no
+window to open.
 
 ### From source with make
 
@@ -135,6 +138,7 @@ sudo make install    # installs to /usr/local by default, honours PREFIX/DESTDIR
 `make install` installs:
 
 - `/usr/bin/rnetapplet`
+- `/usr/bin/rnetapplet-popup`
 - `/usr/share/applications/rnetapplet.desktop`
 - `/usr/lib/systemd/user/rnetapplet.service`
 
@@ -232,6 +236,21 @@ rnetapplet --wifi on|off     # toggle the Wi-Fi radio, then exit
 rnetapplet --connect-saved "SSID"
 ```
 
+## Memory
+
+The applet is two processes so the always-on part stays lean:
+
+| Process | Measured RSS | Notes |
+|---|---|---|
+| `rnetapplet` (tray daemon) | ~14 MB | Links 5 shared libraries; no GTK. Target: stay under 30 MB. |
+| `rnetapplet-popup` (window) | ~100 MB while open, 0 when closed | Mostly the shared GTK stack (~65 MB, shared with every GTK app); ~41 MB proportional set size. Exits on close. |
+
+Measured on Arch Linux (`grep VmRSS /proc/$(pgrep -x rnetapplet)/status`;
+proportional size via `/proc/<pid>/smaps` `Pss` lines). The tray keeps a
+jemalloc allocator tuned for prompt release (1 MB thread cache, 1 s dirty
+decay, no transparent hugepages) and logs its breakdown every 5 minutes
+(`journalctl --user -u rnetapplet | grep "allocator stats"`).
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
@@ -239,7 +258,10 @@ rnetapplet --connect-saved "SSID"
 | No tray icon | No StatusNotifierItem host running; enable the waybar `tray` module. |
 | Popup does not open | The compositor must support `wlr-layer-shell`. |
 | Hotspot fails to start | The Wi-Fi driver does not support AP mode; check `journalctl -u NetworkManager`. |
-| Missing icons | Run `rnetapplet --dump-aps` and look at the icon-theme audit. |
+| Hotspot disconnects Wi-Fi | Expected on single-radio cards: the same radio cannot stay on a network and host an AP at once. The applet restores the station automatically on stop. |
+| Missing icons | Run `rnetapplet-popup --audit-icons` and look at the icon-theme audit. |
+| Camera QR fails | Your user must be in the `video` group for `/dev/video*` access; test with `rnetapplet-popup --camera-test`. |
+| Shows "no internet" on working Wi-Fi | Usually a captive portal or a failing connectivity check; the icon clears when NetworkManager reports full connectivity. |
 | Popup theme differs when autostarted by systemd | The user manager did not inherit the compositor's environment. See [Running under systemd](#running-under-systemd) for the per-service drop-in or `import-environment` fix. |
 
 ## Development
@@ -254,10 +276,15 @@ RUST_LOG=rnetapplet=debug cargo run
 The code is split into `nm_client` (NetworkManager over D-Bus),
 `secret_agent` (the NetworkManager SecretAgent implementation), `tray`
 (the StatusNotifierItem), `ui` (the GTK4 + wlr-layer-shell popup), and
-`qr` / `qr_scan` (QR decode and camera scanning). The resident process owns
-the NetworkManager connection, the tray icon and the background tokio
-runtime and never initializes GTK, so idle memory stays small. The popup
-and the QR scanner each run as a short-lived child process
-(`rnetapplet --popup-child`, `rnetapplet --scan-qr`) that renders models
-streamed over a pipe and sends commands back the same way; when the window
-closes, the process exits and the OS reclaims all of its memory.
+`qr` / `qr_scan` (QR decode and camera scanning). The resident process
+(`rnetapplet`) owns the NetworkManager connection, the tray icon and the
+background tokio runtime and never loads GTK at all, so idle memory stays
+small. The popup and the QR scanner each run as a short-lived
+`rnetapplet-popup` child process (`--popup-child`, `--scan-qr`) that
+renders models streamed over a pipe and sends commands back the same way;
+when the window closes, the process exits and the OS reclaims all of its
+memory. Building the tray alone needs no GTK: plain `cargo build`;
+`--features popup` pulls the GUI stack for the popup binary.
+
+MSRV is Rust 1.92 (`rust-version` in `Cargo.toml`); CI pins `--locked`
+dependencies.

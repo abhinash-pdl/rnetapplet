@@ -30,6 +30,7 @@ pub(crate) fn run_popup_child(pos: Option<(i32, i32)>) -> anyhow::Result<()> {
     let (ev_tx, ev_rx) = async_channel::bounded::<UiEvent>(64);
     std::thread::spawn(move || {
         use std::io::BufRead as _;
+        let mut dropped = 0u64;
         loop {
             let mut line = String::new();
             let n = std::io::stdin().lock().read_line(&mut line);
@@ -42,8 +43,13 @@ pub(crate) fn run_popup_child(pos: Option<(i32, i32)>) -> anyhow::Result<()> {
             let Ok(ev) = serde_json::from_str::<UiEvent>(&line) else {
                 continue;
             };
-            if ev_tx.send_blocking(ev).is_err() {
-                break;
+            match ev_tx.try_send(ev) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(_)) => {
+                    dropped += 1;
+                    tracing::debug!(dropped, "child model queue full; dropping stale model");
+                }
+                Err(async_channel::TrySendError::Closed(_)) => break,
             }
         }
     });

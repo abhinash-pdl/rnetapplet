@@ -22,6 +22,7 @@ struct Inner {
     provided: HashMap<String, Vec<String>>,
     waiters: Vec<Waiter>,
     served_psk: HashMap<String, Secret>,
+    rejected: HashMap<String, u32>,
 }
 #[derive(Default)]
 pub struct SecretStore {
@@ -33,6 +34,7 @@ impl SecretStore {
     }
     pub async fn provide(&self, path: &str, psk: String) -> bool {
         let mut g = self.inner.lock().await;
+        g.rejected.remove(path);
         if g.waiters.iter().any(|w| w.path == path) {
             let mut i = 0;
             while i < g.waiters.len() {
@@ -73,6 +75,24 @@ impl SecretStore {
 
     pub async fn take_served_psk(&self, path: &str) -> Option<Secret> {
         self.inner.lock().await.served_psk.remove(path)
+    }
+
+    pub async fn note_rejected(&self, path: &str) {
+        let mut g = self.inner.lock().await;
+        if g.served_psk.contains_key(path) {
+            *g.rejected.entry(path.to_string()).or_default() += 1;
+        }
+    }
+
+    pub async fn rejected(&self, path: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .rejected
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+            > 0
     }
 
     pub async fn clear_served(&self, path: &str) {
@@ -205,6 +225,9 @@ impl SecretAgentImpl {
     ) -> fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
         let path = connection_path.to_string();
         let request_new = flags & FLAG_REQUEST_NEW != 0;
+        if request_new {
+            self.store.note_rejected(&path).await;
+        }
         let cached = if request_new {
             None
         } else {
@@ -349,11 +372,24 @@ mod tests {
         assert!(m["802-11-wireless-security"].contains_key("psk"));
     }
     #[tokio::test]
-    async fn provide_before_wait_resolves() {
+    async fn clear_served_drops_consumption_proof() {
         let s = SecretStore::new();
-        s.provide("/c/1", "pw1".into()).await;
-        assert_eq!(s.try_take("/c/1").await.as_deref(), Some("pw1"));
-        assert_eq!(s.try_take("/c/1").await, None);
+        s.provide("/c/3", "pw3".into()).await;
+        assert_eq!(s.try_take("/c/3").await.as_deref(), Some("pw3"));
+        s.clear_served("/c/3").await;
+        assert!(s.take_served_psk("/c/3").await.is_none());
+    }
+    #[tokio::test]
+    async fn rejection_tracks_only_served_secrets() {
+        let s = SecretStore::new();
+        s.note_rejected("/c/9").await;
+        assert!(!s.rejected("/c/9").await);
+        s.provide("/c/9", "pw9".into()).await;
+        assert_eq!(s.try_take("/c/9").await.as_deref(), Some("pw9"));
+        s.note_rejected("/c/9").await;
+        assert!(s.rejected("/c/9").await);
+        s.provide("/c/9", "pw9b".into()).await;
+        assert!(!s.rejected("/c/9").await);
     }
     #[tokio::test]
     async fn take_reports_consumed_secret_value_once() {
@@ -374,14 +410,6 @@ mod tests {
         s.provide("/c/2", "pw2".into()).await;
         assert_eq!(waiter.await.unwrap().as_deref(), Some("pw2"));
         assert_eq!(s.take_served_psk("/c/2").await.as_deref(), Some("pw2"));
-    }
-    #[tokio::test]
-    async fn clear_served_drops_consumption_proof() {
-        let s = SecretStore::new();
-        s.provide("/c/3", "pw3".into()).await;
-        assert_eq!(s.try_take("/c/3").await.as_deref(), Some("pw3"));
-        s.clear_served("/c/3").await;
-        assert!(s.take_served_psk("/c/3").await.is_none());
     }
     #[tokio::test]
     async fn wait_then_provide_resolves() {
