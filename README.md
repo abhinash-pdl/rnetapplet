@@ -102,17 +102,17 @@ install it:
 
 ```sh
 curl -L -o rnetapplet.tar.gz \
-  https://github.com/abhinash-pdl/rnetapplet/releases/download/v1.0.0/rnetapplet-1.0.0-x86_64-linux.tar.gz
-echo "1bbaf596e1a8798b8262b77bbead1bfe0282c2033e38eabc6e048e8b1edea3cb  rnetapplet.tar.gz" | sha256sum -c -
+  https://github.com/abhinash-pdl/rnetapplet/releases/download/v1.0.1/rnetapplet-1.0.1-x86_64-linux.tar.gz
+echo "5f551823810223cb04f2c0e95b168e64a4f98554c9639c23686343f984b79bcd  rnetapplet.tar.gz" | sha256sum -c -
 tar xzf rnetapplet.tar.gz
-cd rnetapplet-1.0.0-x86_64-linux
+cd rnetapplet-1.0.1-x86_64-linux
 sudo install -Dm755 rnetapplet /usr/bin/rnetapplet
 sudo install -Dm755 rnetapplet-popup /usr/bin/rnetapplet-popup
 sudo install -Dm644 rnetapplet.desktop /usr/share/applications/rnetapplet.desktop
 sudo install -Dm644 rnetapplet.service /usr/lib/systemd/user/rnetapplet.service
 ```
 
-On 64-bit ARM machines, use the `rnetapplet-1.0.0-aarch64-linux.tar.gz`
+On 64-bit ARM machines, use the `rnetapplet-1.0.1-aarch64-linux.tar.gz`
 asset from the same release instead (same steps, same checksum flow with
 its own `.sha256` file).
 
